@@ -55,7 +55,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero3.yaml
     --total_episodes 10000 \
     --model_name_or_path EleutherAI/pythia-1b-deduped \
     --sft_model_path EleutherAI/pythia-1b-deduped \
-    --reward_model_path EleutherAI/pythia-1b-deduped \
+    # --reward_model_path EleutherAI/pythia-1b-deduped \
     --local_rollout_forward_batch_size 1 \
     --missing_eos_penalty 1.0
 """
@@ -76,9 +76,9 @@ if __name__ == "__main__":
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
-    )
+    # reward_model = AutoModelForSequenceClassification.from_pretrained(
+    #     training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+    # )
     ref_policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
     )
@@ -91,9 +91,9 @@ if __name__ == "__main__":
     dataset = load_dataset(
         script_args.dataset_name, name=script_args.dataset_config, split=script_args.dataset_train_split
     )
-    eval_samples = 100
-    train_dataset = dataset.select(range(len(dataset) - eval_samples))
-    eval_dataset = dataset.select(range(len(dataset) - eval_samples, len(dataset)))
+    # eval_samples = 100
+    train_dataset = dataset.select(range(len(dataset)))
+    # eval_dataset = dataset.select(range(len(dataset) - eval_samples, len(dataset)))
     dataset_text_field = "prompt"
 
     def prepare_dataset(dataset, tokenizer):
@@ -104,12 +104,12 @@ if __name__ == "__main__":
                 element[dataset_text_field],
                 padding=False,
             )
-            return {"input_ids": outputs["input_ids"]}
+            return {"input_ids": outputs["input_ids"], "target": element["target"], "answer_format": element["answer_format"]}
 
         return dataset.map(
             tokenize,
             batched=True,
-            remove_columns=dataset.column_names,
+            remove_columns=[col for col in dataset.column_names if col not in ("input_ids", "target", "answer_format")],
             num_proc=training_args.dataset_num_proc,
         )
 
@@ -117,7 +117,7 @@ if __name__ == "__main__":
     # see: https://github.com/huggingface/trl/pull/1255
     with PartialState().local_main_process_first():
         train_dataset = prepare_dataset(train_dataset, tokenizer)
-        eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+        # eval_dataset = prepare_dataset(eval_dataset, tokenizer)
 
     ################
     # Training
@@ -127,9 +127,9 @@ if __name__ == "__main__":
         processing_class=tokenizer,
         policy=policy,
         ref_policy=ref_policy,
-        reward_model=reward_model,
+        # reward_model=reward_model,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        # eval_dataset=eval_dataset,
     )
     trainer.train()
 
@@ -138,4 +138,4 @@ if __name__ == "__main__":
     if training_args.push_to_hub:
         trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
-    trainer.generate_completions()
+    # trainer.generate_completions()

@@ -15,9 +15,11 @@
 import gc
 import math
 import os
+import re
 import textwrap
 import time
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Union
 
 import numpy as np
@@ -40,11 +42,17 @@ from transformers import (
     TrainerCallback,
     TrainerControl,
     is_wandb_available,
+    StoppingCriteriaList,
+    StoppingCriteria
 )
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
+from transformers.utils import is_peft_available
+if is_peft_available():
+    from peft import PeftConfig, PeftModel, get_peft_model
 
+from ..models import create_reference_model
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
     OnlineTrainerState,
@@ -59,14 +67,84 @@ from ..trainer.utils import (
     truncate_response,
 )
 from .rloo_config import RLOOConfig
-from .utils import generate_model_card, get_comet_experiment_url, log_table_to_comet_experiment
+from .utils import generate_model_card, get_comet_experiment_url, log_table_to_comet_experiment, peft_module_casting_to_bf16
 
 
 if is_wandb_available():
     import wandb
 
 INVALID_LOGPROB = 1.0
-# edit
+
+
+class StopOnSubstring(StoppingCriteria):
+    def __init__(self, stop_string, tokenizer):
+        self.stop_string = stop_string
+        self.tokenizer = tokenizer
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return self.stop_string in self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+
+def post_process_answer(answer, answer_format):
+    """
+    Post-process answers to comply with the formatting rules.
+    """
+    match = re.search(r"\bA:\s*(.*?)($|\n)", answer, re.IGNORECASE)
+    if not match:
+        return ""
+    answer = match.group(1).strip().lower()
+
+    if answer_format == "Answer with only a sequence of words." or answer_format == "Answer with only a sequence of space-separated parentheses.":
+        if '\n' in answer:
+            answer = answer.split('\n')[0]
+        if '-' in answer:
+            answer = answer.split('-')[0]
+    else:
+        answer = answer.split()[0]
+
+    if '.' in answer:
+        answer = answer.split('.')[0]
+
+    if answer_format == "Answer with only the corresponding letter (e.g. (A)).":
+        if answer and answer[0] != "(":
+            answer = "(" + answer[0] + ")"
+
+    if answer_format == "Answer with only 'Yes' or 'No'.":
+        if answer == "true":
+            answer = "yes"
+        elif answer == "false":
+            answer = "no"
+
+    return answer
+
+
+class RLDataCollatorWithPadding:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.default_collator = DataCollatorWithPadding(tokenizer, padding=True)
+
+    def __call__(self, features):
+        # separate out the numeric fields vs. string fields
+        numeric_features = []
+        string_targets = []
+        string_answer_formats = []
+
+        for f in features:
+            numeric_features.append({
+                "input_ids": f["input_ids"]
+            })
+            string_targets.append(f["target"])
+            string_answer_formats.append(f["answer_format"])
+
+        # let the default collator handle the numeric fields
+        batch = self.default_collator(numeric_features)
+
+        # pass the strings through uncollated
+        batch["target"] = string_targets
+        batch["answer_format"] = string_answer_formats
+
+        return batch
+
 
 class RLOOTrainer(Trainer):
     _tag_names = ["trl", "rloo"]
@@ -78,19 +156,20 @@ class RLOOTrainer(Trainer):
             Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
         ],
         policy: nn.Module,
-        ref_policy: nn.Module,
-        reward_model: nn.Module,
         train_dataset: Dataset,
+        ref_policy: Optional[nn.Module] = None,
+        # reward_model: nn.Module,
         data_collator: Optional[DataCollatorWithPadding] = None,
-        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
+        # eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         # less commonly used
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
+        peft_config: Optional["PeftConfig"] = None,
     ) -> None:
         if ref_policy is policy:
             raise ValueError(
                 "`policy` and `ref_policy` cannot be the same object. If you want `ref_policy` to be the "
-                "same as `policy`, you must mass a copy of it, or `None` if you use peft."
+                "same as `policy`, you must make a copy of it, or `None` if you use peft."
             )
 
         self.args = config
@@ -107,12 +186,37 @@ class RLOOTrainer(Trainer):
         )
         self.policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
 
-        self.ref_policy = ref_policy
-        self.reward_model = reward_model
+        # self.ref_policy = ref_policy
+
+        # peft support
+        if not is_peft_available() and peft_config is not None:
+            raise ImportError(
+                "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
+            )
+        elif is_peft_available() and peft_config is not None:
+            # if model is a peft model and we have a peft_confg, we merge and unload it first
+            if isinstance(self.policy, PeftModel):
+                self.policy = self.policy.merge_and_unload()
+            # get peft model with the given config
+            self.policy = get_peft_model(self.policy, peft_config)
+            if args.bf16 and getattr(self.policy, "is_loaded_in_4bit", False):
+                peft_module_casting_to_bf16(self.policy)
+        self.is_peft_model = is_peft_available() and isinstance(self.policy, PeftModel)
+        self.model_adapter_name = args.model_adapter_name
+        self.ref_adapter_name = args.ref_adapter_name
+        if ref_policy:
+            self.ref_policy = ref_policy
+        elif self.is_peft_model:
+            self.ref_policy = None
+        else:
+            self.ref_policy = create_reference_model(self.policy)
+
+
+        # self.reward_model = reward_model
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.data_collator = data_collator
-        self.eval_dataset = eval_dataset
+        # self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
 
@@ -151,8 +255,9 @@ class RLOOTrainer(Trainer):
         #########
         # setup model, optimizer, and others
         #########
-        for module in [policy, ref_policy, reward_model]:
-            disable_dropout_in_model(module)
+        for module in [policy, ref_policy]: # reward_model
+            if module is not None:
+                disable_dropout_in_model(module)
         if args.stop_token and args.stop_token == "eos":
             args.stop_token_id = self.processing_class.eos_token_id
         self.model = policy
@@ -197,6 +302,8 @@ class RLOOTrainer(Trainer):
         #########
         ### setup dataloader
         #########
+        print(f"Sample from train_dataset: {self.train_dataset[0]}")
+
         self.dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.local_dataloader_batch_size,
@@ -204,37 +311,54 @@ class RLOOTrainer(Trainer):
             collate_fn=self.data_collator,
             drop_last=True,  # needed; otherwise the last batch will be of ragged shape
         )
+        print("dataloader", self.dataloader)
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
         self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
-        self.eval_dataloader = DataLoader(
-            self.eval_dataset,
-            batch_size=args.per_device_eval_batch_size,
-            collate_fn=self.data_collator,
-            drop_last=True,
-        )  # no need to shuffle eval dataset
-        self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
+        # self.eval_dataloader = DataLoader(
+        #     self.eval_dataset,
+        #     batch_size=args.per_device_eval_batch_size,
+        #     collate_fn=self.data_collator,
+        #     drop_last=True,
+        # )  # no need to shuffle eval dataset
+        # self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
-            self.reward_model = prepare_deepspeed(
-                self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
-            )
+            # self.reward_model = prepare_deepspeed(
+            #     self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
+            # )
             self.ref_policy = prepare_deepspeed(
                 self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
             )
             self.deepspeed = self.model
         else:
-            self.ref_policy = self.ref_policy.to(self.accelerator.device)
-            self.reward_model = self.reward_model.to(self.accelerator.device)
+            # self.ref_policy = self.ref_policy.to(self.accelerator.device)
+            if self.ref_policy is None:
+                if not self.is_peft_model:
+                    raise ValueError("No reference model and model is not a Peft model.")
+            else:
+                self.ref_policy = self.ref_policy.to(self.accelerator.device)
+            # self.reward_model = self.reward_model.to(self.accelerator.device)
+
+    @contextmanager
+    def null_ref_context(self):
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with self.accelerator.unwrap_model(self.model).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.ref_adapter_name)  # Corrected here
+            yield
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.model_adapter_name or "default")  # Corrected here
+
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
-    def get_eval_dataloader(self) -> DataLoader:
-        return self.eval_dataloader
+    # def get_eval_dataloader(self) -> DataLoader:
+    #     return self.eval_dataloader
 
     def train(self):
         args = self.args
@@ -243,7 +367,7 @@ class RLOOTrainer(Trainer):
         model = self.model
         self.model_wrapped = self.model
         ref_policy = self.ref_policy
-        reward_model = self.reward_model
+        # reward_model = self.reward_model
         processing_class = self.processing_class
         dataloader = self.dataloader
         device = accelerator.device
@@ -283,11 +407,11 @@ class RLOOTrainer(Trainer):
                 self.state.logging_steps = math.ceil(self.state.max_steps * args.logging_steps)
             else:
                 self.state.logging_steps = args.logging_steps
-        if args.eval_steps is not None:
-            if args.eval_steps < 1:
-                self.state.eval_steps = math.ceil(self.state.max_steps * args.eval_steps)
-            else:
-                self.state.eval_steps = args.eval_steps
+        # if args.eval_steps is not None:
+        #     if args.eval_steps < 1:
+        #         self.state.eval_steps = math.ceil(self.state.max_steps * args.eval_steps)
+        #     else:
+        #         self.state.eval_steps = args.eval_steps
         if args.save_steps is not None:
             if args.save_steps < 1:
                 self.state.save_steps = math.ceil(self.state.max_steps * args.save_steps)
@@ -315,6 +439,7 @@ class RLOOTrainer(Trainer):
                         args.local_rollout_forward_batch_size,
                         processing_class.pad_token_id,
                         generation_config,
+                        # stopping_criteria = StoppingCriteriaList([StopOnSubstring("Q:", processing_class)])
                     )
 
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
@@ -327,7 +452,13 @@ class RLOOTrainer(Trainer):
                     del logits, all_logprob
                     torch.cuda.empty_cache()
 
-                    ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                    # ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                    if ref_policy is None:
+                        with self.null_ref_context():
+                            ref_output = forward(model, query_response, processing_class.pad_token_id)
+                    else:
+                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
@@ -343,18 +474,40 @@ class RLOOTrainer(Trainer):
                         )
 
                     # Response Processing 2. run reward model on the truncated responses
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                    # postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
-                    _, score, _ = get_reward(
-                        reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    # _, score, _ = get_reward(
+                    #     reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    # )
+                    decoded_responses = processing_class.batch_decode(
+                        postprocessed_response, skip_special_tokens=True
                     )
+                    batch_targets = data["target"][i : i + args.local_rollout_forward_batch_size]
+
+                    batch_scores = []
+                    print(len(decoded_responses), len(batch_targets))
+                    for pred_text, gold_text in zip(decoded_responses, batch_targets * args.rloo_k):
+                        # post-process
+                        print("pred_text", pred_text)
+                        print("gold_text", gold_text)
+                        processed_pred = post_process_answer(pred_text, answer_format=data["answer_format"])
+                        print("processed_pred", processed_pred)
+                        processed_gold = gold_text.strip().lower()
+                        # binary match
+                        if processed_pred == processed_gold:
+                            batch_scores.append(1.0)
+                        else:
+                            batch_scores.append(0.0)
+                    score = torch.tensor(batch_scores, device=device, dtype=torch.float32)
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
                     logprobs.append(logprob)
+                    print("appended logprob", logprob)
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
+                    print("appended score", score)
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
@@ -364,6 +517,11 @@ class RLOOTrainer(Trainer):
                 del (logprob, ref_logprob, score)
                 torch.cuda.empty_cache()
                 gc.collect()
+                print('#' * 99)
+                print(responses)
+                print('=' * 99)
+                print(scores, logprobs, ref_logprobs, sequence_lengths)
+                print('-' * 99)
 
                 # Response Processing 3. filter response. Ensure that the sample contains stop_token_id
                 # responses not passing that filter will receive a low (fixed) score
@@ -381,7 +539,23 @@ class RLOOTrainer(Trainer):
 
                 # 4. compute rewards
                 kl = logprobs - ref_logprobs
-                non_score_reward = (-args.kl_coef * kl).sum(1)
+                # non_score_reward = (-args.kl_coef * kl).sum(1)
+
+                # Normalize rewards
+                if args.normalize_reward:
+                    scores = (scores - scores.mean()) / (scores.std() + 1e-8)
+                    scores = torch.clamp(scores, -args.reward_clip_range, args.reward_clip_range)
+                # Compute total reward with KL penalty
+                if args.token_level_kl:
+                    # Token-level KL penalty: apply KL penalty per token
+                    token_kl_penalty = -args.kl_coef * kl
+                    non_score_reward = token_kl_penalty.sum(1)
+                else:
+                    # Sequence-level KL penalty: sum KL across tokens first
+                    sequence_kl = kl.sum(1)
+                    non_score_reward = -args.kl_coef * sequence_kl
+                print("scores:")
+                print(scores, non_score_reward)
                 rlhf_reward = scores + non_score_reward
 
                 # vectorized RLOO advantages implementation
@@ -389,6 +563,10 @@ class RLOOTrainer(Trainer):
                 baseline = (rlhf_reward.sum(0) - rlhf_reward) / (args.rloo_k - 1)
                 advantages = rlhf_reward - baseline
                 advantages = advantages.flatten()
+
+                if args.normalize_advantage:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
                 torch.cuda.empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
@@ -490,8 +668,15 @@ class RLOOTrainer(Trainer):
             torch.cuda.empty_cache()
             gc.collect()
 
-            if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
-                self.generate_completions(sampling=True)
+            # if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
+            #     self.generate_completions(sampling=True)
+
+        if self.is_peft_model:
+            lora_save_path = os.path.join(self.args.output_dir, "lora_adapter")
+            os.makedirs(lora_save_path, exist_ok=True)
+            self.model.save_pretrained(lora_save_path)
+            print(f"[RLOOTrainer] LoRA adapter saved to {lora_save_path}")
+
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
@@ -499,66 +684,86 @@ class RLOOTrainer(Trainer):
             self._save_checkpoint(model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
-    def generate_completions(self, sampling: bool = False):
-        args = self.args
-        processing_class = self.processing_class
-        generation_config = GenerationConfig(
-            max_new_tokens=self.args.response_length,
-            temperature=(0.01 + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
-        )
+    @property
+    def lora_adapter_path(self):
+        if self.is_peft_model:
+            return os.path.join(self.args.output_dir, "lora_adapter")
+        return None
 
-        table = defaultdict(list)
-        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-            for batch in self.eval_dataloader:
-                query = batch["input_ids"]
-                with torch.no_grad():
-                    context_length = query.shape[1]
-                    query_response, _ = batch_generation(
-                        unwrapped_model,
-                        query,
-                        query.shape[0],
-                        processing_class.pad_token_id,
-                        generation_config,
-                    )
-                    response = query_response[:, context_length:]
-                    postprocessed_response = response
-                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
-                        postprocessed_response = truncate_response(
-                            args.stop_token_id, processing_class.pad_token_id, response
-                        )
-                    table["query"].extend(
-                        gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
-                    )
-                    table["model response"].extend(
-                        gather_object(processing_class.batch_decode(postprocessed_response))
-                    )
+    # def generate_completions(self, sampling: bool = False):
+    #     args = self.args
+    #     processing_class = self.processing_class
+    #     generation_config = GenerationConfig(
+    #         max_new_tokens=self.args.response_length,
+    #         temperature=(0.01 + 1e-7),
+    #         top_k=0.0,
+    #         top_p=1.0,
+    #         do_sample=True,
+    #     )
 
-                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
-                    _, score, _ = get_reward(
-                        self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-                    )
-                    table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
+    #     table = defaultdict(list)
+    #     with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+    #         for batch in self.eval_dataloader:
+    #             query = batch["input_ids"]
+    #             with torch.no_grad():
+    #                 context_length = query.shape[1]
+    #                 query_response, _ = batch_generation(
+    #                     unwrapped_model,
+    #                     query,
+    #                     query.shape[0],
+    #                     processing_class.pad_token_id,
+    #                     generation_config,
+    #                 )
+    #                 response = query_response[:, context_length:]
+    #                 postprocessed_response = response
+    #                 if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+    #                     postprocessed_response = truncate_response(
+    #                         args.stop_token_id, processing_class.pad_token_id, response
+    #                     )
 
-                if sampling:
-                    break
-        df = pd.DataFrame(table)
+    #                 # decode predictions
+    #                 decoded_preds = processing_class.batch_decode(postprocessed_response, skip_special_tokens=True)
+    #                 decoded_queries = processing_class.batch_decode(query, skip_special_tokens=True)
+    #                 targets = batch["target"]
 
-        if self.accelerator.is_main_process:
-            print_rich_table(df.iloc[0 : 0 + 5])
-            if "wandb" in args.report_to:
-                import wandb
+    #                 table["query"].extend(gather_object(decoded_queries))
+    #                 table["model response"].extend(gather_object(decoded_preds))
 
-                if wandb.run is not None:
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+    #                 batch_scores = []
+    #                 for pred_text, gold_text in zip(decoded_preds, targets):
+    #                     if isinstance(batch["answer_format"], list):
+    #                         answer_format = batch["answer_format"][0]
+    #                     else:
+    #                         answer_format = batch["answer_format"]
+    #                     processed_pred = post_process_answer(pred_text, answer_format)
+    #                     processed_gold = gold_text.strip().lower()
+    #                     batch_scores.append(1.0 if processed_pred == processed_gold else 0.0)
 
-            if "comet_ml" in args.report_to:
-                log_table_to_comet_experiment(
-                    name="completions.csv",
-                    table=df,
-                )
+    #                 # gather for metrics or put directly in the table
+    #                 table["score"].extend(self.accelerator.gather_for_metrics(torch.tensor(batch_scores)))
+
+    #                 # _, score, _ = get_reward(
+    #                 #     self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+    #                 # )
+    #                 # table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
+
+    #             if sampling:
+    #                 break
+        # df = pd.DataFrame(table)
+
+        # if self.accelerator.is_main_process:
+        #     print_rich_table(df.iloc[0 : 0 + 5])
+        #     if "wandb" in args.report_to:
+        #         import wandb
+
+        #         if wandb.run is not None:
+        #             wandb.log({"completions": wandb.Table(dataframe=df)})
+
+        #     if "comet_ml" in args.report_to:
+        #         log_table_to_comet_experiment(
+        #             name="completions.csv",
+        #             table=df,
+        #         )
 
     def create_model_card(
         self,

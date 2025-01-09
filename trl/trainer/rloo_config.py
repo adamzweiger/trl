@@ -14,6 +14,7 @@
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 from ..trainer.utils import OnPolicyConfig
 
@@ -30,8 +31,12 @@ class RLOOConfig(OnPolicyConfig):
     Parameters:
         exp_name (`str`, *optional*, defaults to `os.path.basename(__file__)[: -len(".py")]`):
             Name of this experiment.
-        reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
-            Path to the reward model.
+        # reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
+        #     Path to the reward model.
+        model_adapter_name (`Optional[str]`, *optional*, defaults to `None`):
+            Name of the train target PEFT adapter, when using LoRA with multiple adapters.
+        ref_adapter_name (`Optional[str]`, *optional*, defaults to `None`):
+            Name of the reference PEFT adapter, when using LoRA with multiple adapters.
         num_ppo_epochs (`int`, *optional*, defaults to `4`):
             Number of epochs to train.
         whiten_rewards (`bool`, *optional*, defaults to `False`):
@@ -42,15 +47,31 @@ class RLOOConfig(OnPolicyConfig):
             Clip range.
         rloo_k (`int`, *optional*, defaults to `2`):
             REINFORCE Leave-One-Out (RLOO) number of online samples per prompt.
+        normalize_reward (`bool`, *optional*, defaults to `False`):
+            Whether to normalize rewards.
+        reward_clip_range (`float`, *optional*, defaults to `10.0`):
+            Clip range for rewards.
+        normalize_advantage (`bool`, *optional*, defaults to `False`):
+            Whether to normalize advantages.
+        token_level_kl (`bool`, *optional*, defaults to `True`):
+            Whether to use token-level KL penalty or sequence-level KL penalty.
     """
 
     exp_name: str = field(
         default=os.path.basename(__file__)[:-3],
         metadata={"help": "Name of this experiment."},
     )
-    reward_model_path: str = field(
-        default="EleutherAI/pythia-160m",
-        metadata={"help": "Path to the reward model."},
+    # reward_model_path: str = field(
+    #     default="EleutherAI/pythia-160m",
+    #     metadata={"help": "Path to the reward model."},
+    # )
+    model_adapter_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Name of the train target PEFT adapter, when using LoRA with multiple adapters."},
+    )
+    ref_adapter_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."},
     )
     num_ppo_epochs: int = field(
         default=4,
@@ -71,4 +92,20 @@ class RLOOConfig(OnPolicyConfig):
     rloo_k: int = field(
         default=2,
         metadata={"help": "REINFORCE Leave-One-Out (RLOO) number of online samples per prompt."},
+    )
+    normalize_reward: bool = field(
+        default=False,
+        metadata={"help": "Whether to normalize rewards"},
+    )
+    reward_clip_range: float = field(
+        default=10.0,
+        metadata={"help": "Clip range for rewards"},
+    )
+    normalize_advantage: bool = field(
+        default=False,
+        metadata={"help": "Whether to normalize advantages"},
+    )
+    token_level_kl: bool = field(
+        default=True,
+        metadata={"help": "Whether to use token-level KL penalty or sequence-level KL penalty"},
     )
