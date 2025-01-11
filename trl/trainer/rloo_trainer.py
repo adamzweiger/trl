@@ -93,6 +93,8 @@ def post_process_answer(answer, answer_format):
     if not match:
         return ""
     answer = match.group(1).strip().lower()
+    if not answer:
+        return ""
 
     if answer_format == "Answer with only a sequence of words." or answer_format == "Answer with only a sequence of space-separated parentheses.":
         if '\n' in answer:
@@ -160,7 +162,7 @@ class RLOOTrainer(Trainer):
         ref_policy: Optional[nn.Module] = None,
         # reward_model: nn.Module,
         data_collator: Optional[DataCollatorWithPadding] = None,
-        # eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
+        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         # less commonly used
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
@@ -216,7 +218,7 @@ class RLOOTrainer(Trainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.data_collator = data_collator
-        # self.eval_dataset = eval_dataset
+        self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
 
@@ -318,13 +320,13 @@ class RLOOTrainer(Trainer):
         self.model, self.optimizer, self.dataloader = accelerator.prepare(self.model, self.optimizer, self.dataloader)
         torch.manual_seed(self.local_seed)  # reset the local seed again
 
-        # self.eval_dataloader = DataLoader(
-        #     self.eval_dataset,
-        #     batch_size=args.per_device_eval_batch_size,
-        #     collate_fn=self.data_collator,
-        #     drop_last=True,
-        # )  # no need to shuffle eval dataset
-        # self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
+        self.eval_dataloader = DataLoader(
+            self.eval_dataset,
+            batch_size=args.per_device_eval_batch_size,
+            collate_fn=self.data_collator,
+            drop_last=True,
+        )  # no need to shuffle eval dataset
+        self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
         if self.is_deepspeed_enabled:
             # self.reward_model = prepare_deepspeed(
@@ -357,8 +359,8 @@ class RLOOTrainer(Trainer):
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
 
-    # def get_eval_dataloader(self) -> DataLoader:
-    #     return self.eval_dataloader
+    def get_eval_dataloader(self) -> DataLoader:
+        return self.eval_dataloader
 
     def train(self):
         args = self.args
@@ -540,7 +542,8 @@ class RLOOTrainer(Trainer):
                 # 4. compute rewards
                 kl = logprobs - ref_logprobs
                 # non_score_reward = (-args.kl_coef * kl).sum(1)
-
+                prompt = self.processing_class.decode(data["input_ids"][0], skip_special_tokens=True)
+                print(f"{sum(scores).item()} is the number of right answers for prompt {prompt}")
                 # Normalize rewards
                 if args.normalize_reward:
                     scores = (scores - scores.mean()) / (scores.std() + 1e-8)
@@ -668,8 +671,8 @@ class RLOOTrainer(Trainer):
             torch.cuda.empty_cache()
             gc.collect()
 
-            # if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
-            #     self.generate_completions(sampling=True)
+            if args.num_sample_generations > 0 and (update - 1) % self.sample_generations_freq == 0:
+                self.generate_completions(sampling=True)
 
         if self.is_peft_model:
             lora_save_path = os.path.join(self.args.output_dir, "lora_adapter")
@@ -690,80 +693,80 @@ class RLOOTrainer(Trainer):
             return os.path.join(self.args.output_dir, "lora_adapter")
         return None
 
-    # def generate_completions(self, sampling: bool = False):
-    #     args = self.args
-    #     processing_class = self.processing_class
-    #     generation_config = GenerationConfig(
-    #         max_new_tokens=self.args.response_length,
-    #         temperature=(0.01 + 1e-7),
-    #         top_k=0.0,
-    #         top_p=1.0,
-    #         do_sample=True,
-    #     )
+    def generate_completions(self, sampling: bool = False):
+        args = self.args
+        processing_class = self.processing_class
+        generation_config = GenerationConfig(
+            max_new_tokens=self.args.response_length,
+            temperature=(0.01 + 1e-7),
+            top_k=0.0,
+            top_p=1.0,
+            do_sample=True,
+        )
 
-    #     table = defaultdict(list)
-    #     with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-    #         for batch in self.eval_dataloader:
-    #             query = batch["input_ids"]
-    #             with torch.no_grad():
-    #                 context_length = query.shape[1]
-    #                 query_response, _ = batch_generation(
-    #                     unwrapped_model,
-    #                     query,
-    #                     query.shape[0],
-    #                     processing_class.pad_token_id,
-    #                     generation_config,
-    #                 )
-    #                 response = query_response[:, context_length:]
-    #                 postprocessed_response = response
-    #                 if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
-    #                     postprocessed_response = truncate_response(
-    #                         args.stop_token_id, processing_class.pad_token_id, response
-    #                     )
+        table = defaultdict(list)
+        with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+            for batch in self.eval_dataloader:
+                query = batch["input_ids"]
+                with torch.no_grad():
+                    context_length = query.shape[1]
+                    query_response, _ = batch_generation(
+                        unwrapped_model,
+                        query,
+                        query.shape[0],
+                        processing_class.pad_token_id,
+                        generation_config,
+                    )
+                    response = query_response[:, context_length:]
+                    postprocessed_response = response
+                    if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
+                        postprocessed_response = truncate_response(
+                            args.stop_token_id, processing_class.pad_token_id, response
+                        )
 
-    #                 # decode predictions
-    #                 decoded_preds = processing_class.batch_decode(postprocessed_response, skip_special_tokens=True)
-    #                 decoded_queries = processing_class.batch_decode(query, skip_special_tokens=True)
-    #                 targets = batch["target"]
+                    # decode predictions
+                    decoded_preds = processing_class.batch_decode(postprocessed_response, skip_special_tokens=True)
+                    decoded_queries = processing_class.batch_decode(query, skip_special_tokens=True)
+                    targets = batch["target"]
 
-    #                 table["query"].extend(gather_object(decoded_queries))
-    #                 table["model response"].extend(gather_object(decoded_preds))
+                    table["query"].extend(gather_object(decoded_queries))
+                    table["model response"].extend(gather_object(decoded_preds))
 
-    #                 batch_scores = []
-    #                 for pred_text, gold_text in zip(decoded_preds, targets):
-    #                     if isinstance(batch["answer_format"], list):
-    #                         answer_format = batch["answer_format"][0]
-    #                     else:
-    #                         answer_format = batch["answer_format"]
-    #                     processed_pred = post_process_answer(pred_text, answer_format)
-    #                     processed_gold = gold_text.strip().lower()
-    #                     batch_scores.append(1.0 if processed_pred == processed_gold else 0.0)
+                    batch_scores = []
+                    for pred_text, gold_text in zip(decoded_preds, targets):
+                        if isinstance(batch["answer_format"], list):
+                            answer_format = batch["answer_format"][0]
+                        else:
+                            answer_format = batch["answer_format"]
+                        processed_pred = post_process_answer(pred_text, answer_format)
+                        processed_gold = gold_text.strip().lower()
+                        batch_scores.append(1.0 if processed_pred == processed_gold else 0.0)
 
-    #                 # gather for metrics or put directly in the table
-    #                 table["score"].extend(self.accelerator.gather_for_metrics(torch.tensor(batch_scores)))
+                    # gather for metrics or put directly in the table
+                    table["score"].extend(self.accelerator.gather_for_metrics(torch.tensor(batch_scores)))
 
-    #                 # _, score, _ = get_reward(
-    #                 #     self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
-    #                 # )
-    #                 # table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
+                    # _, score, _ = get_reward(
+                    #     self.reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
+                    # )
+                    # table["score"].extend(self.accelerator.gather_for_metrics(score).float().cpu().numpy())
 
-    #             if sampling:
-    #                 break
-        # df = pd.DataFrame(table)
+                if sampling:
+                    break
+        df = pd.DataFrame(table)
 
-        # if self.accelerator.is_main_process:
-        #     print_rich_table(df.iloc[0 : 0 + 5])
-        #     if "wandb" in args.report_to:
-        #         import wandb
+        if self.accelerator.is_main_process:
+            print_rich_table(df.iloc[0 : 0 + 5])
+            if "wandb" in args.report_to:
+                import wandb
 
-        #         if wandb.run is not None:
-        #             wandb.log({"completions": wandb.Table(dataframe=df)})
+                if wandb.run is not None:
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
 
-        #     if "comet_ml" in args.report_to:
-        #         log_table_to_comet_experiment(
-        #             name="completions.csv",
-        #             table=df,
-        #         )
+            if "comet_ml" in args.report_to:
+                log_table_to_comet_experiment(
+                    name="completions.csv",
+                    table=df,
+                )
 
     def create_model_card(
         self,
