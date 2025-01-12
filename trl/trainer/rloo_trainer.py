@@ -159,10 +159,10 @@ class RLOOTrainer(Trainer):
         ],
         policy: nn.Module,
         train_dataset: Dataset,
+        eval_dataset: Dataset,
         ref_policy: Optional[nn.Module] = None,
         # reward_model: nn.Module,
         data_collator: Optional[DataCollatorWithPadding] = None,
-        eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         # less commonly used
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         callbacks: Optional[list[TrainerCallback]] = None,
@@ -704,9 +704,19 @@ class RLOOTrainer(Trainer):
             do_sample=True,
         )
 
+        if len(self.eval_dataloader) == 0:
+            print("Eval dataloader is empty; skipping generation.")
+            return
+
         table = defaultdict(list)
         with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
             for batch in self.eval_dataloader:
+                if batch is None:
+                    print("Received None batch.")
+                    continue
+                if query is None:
+                    print("Warning: Batch missing 'input_ids', skipping.")
+                    continue
                 query = batch["input_ids"]
                 with torch.no_grad():
                     context_length = query.shape[1]
