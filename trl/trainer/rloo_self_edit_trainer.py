@@ -15,18 +15,16 @@ which is then backpropagated to update the RL_lora adapter.
 """
 
 import gc
-import math
 import os
 import time
 from typing import Optional, Callable
 
-import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from datasets import Dataset
 from torch.utils.data import DataLoader
-from transformers import PreTrainedTokenizerBase, Trainer, TrainerCallback, TrainerControl, is_wandb_available
+from transformers import PreTrainedTokenizerBase, Trainer, TrainerCallback, is_wandb_available
 
 if is_wandb_available():
     import wandb
@@ -54,7 +52,7 @@ class RLOOSelfEditTrainer(Trainer):
 
     def __init__(
         self,
-        config,  # expects attributes such as output_dir, per_device_train_batch_size, gradient_accumulation_steps, seed, logging_steps, save_steps, model_name, max_model_len, max_lora_rank, etc.
+        config,
         processing_class: Optional[PreTrainedTokenizerBase],
         policy: nn.Module,
         train_dataset: Dataset,
@@ -67,6 +65,7 @@ class RLOOSelfEditTrainer(Trainer):
         inner_top_p: float = 0.95,
         inner_max_tokens: int = 4096,
         gradient_accumulation_steps: int = 1,
+        gpu_memory_utilization: float = 0.7,  # Lower memory utilization for vLLM
     ) -> None:
         super().__init__(
             model=policy,
@@ -80,7 +79,9 @@ class RLOOSelfEditTrainer(Trainer):
         self.policy = policy  # This is our RL_lora adapter (a PEFT model).
         self.gradient_accumulation_steps = gradient_accumulation_steps
 
-        self.accelerator = Accelerator(gradient_accumulation_steps=self.gradient_accumulation_steps)
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=self.gradient_accumulation_steps
+        )
         self.dataloader = DataLoader(
             self.train_dataset,
             batch_size=config.per_device_train_batch_size,
@@ -98,8 +99,7 @@ class RLOOSelfEditTrainer(Trainer):
             top_p=inner_top_p,
             max_tokens=inner_max_tokens,
             stop_token_ids=[],
-            n=num_generations,
-            logprobs=0
+            n=num_generations
         )
         self.model_name = config.model_name
 
@@ -111,6 +111,7 @@ class RLOOSelfEditTrainer(Trainer):
             max_lora_rank=config.max_lora_rank,
             trust_remote_code=True,
             tensor_parallel_size=2,
+            gpu_memory_utilization=gpu_memory_utilization,
             download_dir=os.environ.get("HF_HOME", None)
         )
 
@@ -126,6 +127,8 @@ class RLOOSelfEditTrainer(Trainer):
         total_reward = 0.0
         total_samples = 0
 
+        print(f"Training started with {len(self.dataloader)} batches.")
+
         for step, batch in enumerate(self.dataloader):
             batch_loss = 0.0
             batch_reward = 0.0
@@ -139,10 +142,13 @@ class RLOOSelfEditTrainer(Trainer):
 
             for sample in samples:
                 prompt = sample.get("prompt", "")
+                print(f"Processing prompt: {prompt}")
                 # Call the inner loop using the prompt, the vLLM model, and the current LoRA adapter.
                 result = rl_inner_loop_iteration(prompt, self.vllm_model, get_lora_request_from_policy(self.policy), self.inner_loop_sampling_params)
+                print(f"Generated {len(result['generations'])} generations for prompt: {prompt}")
                 sample_losses = []
                 for gen_text, reward in zip(result["generations"], result["rewards"]):
+                    print(f"Generated text: {gen_text}, Reward: {reward}")
                     full_text = prompt + gen_text
                     tokenized = self.processing_class(full_text, return_tensors="pt", truncation=True).to(device)
                     outputs = self.model(**tokenized)
@@ -156,6 +162,16 @@ class RLOOSelfEditTrainer(Trainer):
                     selected_log_probs = generated_log_probs.gather(dim=-1, index=generated_token_ids.unsqueeze(-1)).squeeze(-1)
                     total_log_prob = selected_log_probs.sum()
                     sample_losses.append(- reward * total_log_prob)
+
+                    print(f"Sample loss for generation: {sample_losses[-1].item():.4f}, Reward: {reward:.4f}")
+                    
+                    # Clean up intermediate tensors
+                    del tokenized, outputs, logits, generated_logits, generated_log_probs, selected_log_probs
+                    torch.cuda.empty_cache()
+                    
+                # Clean up prompt tokenization
+                del prompt_tokenized, generated_token_ids
+                
                 if sample_losses:
                     sample_loss = sum(sample_losses) / len(sample_losses)
                 else:
@@ -166,15 +182,27 @@ class RLOOSelfEditTrainer(Trainer):
                 batch_count += 1
                 total_samples += 1
 
+                print(f"Batch loss: {batch_loss.item():.4f}, Batch reward: {batch_reward:.4f}, Total samples: {total_samples}")
+                print(f"Average reward for this batch: {avg_reward:.4f}")
+                
+                # Clean up result after each sample
+                del result, sample_losses
+                if 'sample_loss' in locals():
+                    del sample_loss
+
             if batch_count > 0:
                 batch_loss = batch_loss / batch_count
                 batch_reward = batch_reward / batch_count
             else:
                 batch_loss = torch.tensor(0.0, device=device)
 
+            print(f"Batch loss after averaging: {batch_loss.item():.4f}, Batch reward after averaging: {batch_reward:.4f}")
+
             optimizer.zero_grad()
             accelerator.backward(batch_loss)
             optimizer.step()
+
+            print(f"Step {step}: Backpropagation completed. Loss: {batch_loss.item():.4f}, Reward: {batch_reward:.4f}")
 
             total_loss += batch_loss.item()
             total_reward += batch_reward
@@ -184,6 +212,8 @@ class RLOOSelfEditTrainer(Trainer):
             if args.save_steps is not None and step % args.save_steps == 0:
                 self._save_checkpoint(model)
 
+            # Clean up batch variables
+            del batch, batch_loss
             torch.cuda.empty_cache()
             gc.collect()
 
