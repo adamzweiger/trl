@@ -27,7 +27,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, PartialState
-from accelerate.utils import broadcast, gather_object, is_main_process, pad_across_processes, reduce
+from accelerate.utils import broadcast, gather_object, pad_across_processes, reduce
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import (
@@ -68,10 +68,17 @@ else:
     raise ImportError("PEFT is required for RLOOIndirectTrainer. Please install peft.")
 
 try:
-    from vllm import LLM, SamplingParams, LoRARequest
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
     _is_vllm_available = True
-except ImportError:
+except ImportError as e:
     _is_vllm_available = False
+    import sys
+    import os
+    print(f"!!! DEBUG vLLM IMPORT FAILED IN PROCESS !!!")
+    print(f"!!! Python Path (sys.path): {sys.path}")
+    print(f"!!! PYTHONPATH Env Var: {os.environ.get('PYTHONPATH')}")
+    print(f"!!! Import Error: {e}")
     warnings.warn("vLLM not installed. RLOOIndirectTrainer requires vLLM. `pip install vllm`")
 
 if is_wandb_available():
@@ -183,9 +190,18 @@ class RLOOIndirectTrainer(Trainer):
 
 
         # --- Accelerator and Batch Sizes ---
-        accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-        self.accelerator = accelerator
-        args.world_size = accelerator.num_processes
+        # accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+        # self.accelerator = accelerator
+        self.accelerator = Accelerator()
+        if hasattr(args, 'gradient_accumulation_steps') and self.accelerator.gradient_accumulation_steps != args.gradient_accumulation_steps:
+            warnings.warn(
+                f"Configuration mismatch: RLOOIndirectConfig specified gradient_accumulation_steps={args.gradient_accumulation_steps}, "
+                f"but Accelerator was initialized with gradient_accumulation_steps={self.accelerator.gradient_accumulation_steps}. "
+                f"Using the Accelerator's value.",
+                UserWarning
+            )
+
+        args.world_size = self.accelerator.num_processes
 
         # Batch sizes need careful calculation based on dataloader batch size and k
         args.local_batch_size_per_step = args.per_device_train_batch_size * args.gradient_accumulation_steps
@@ -203,10 +219,10 @@ class RLOOIndirectTrainer(Trainer):
         args.num_training_steps = num_training_steps
         args.num_train_epochs = num_train_epochs
 
-        time_tensor = torch.tensor(int(time.time()), device=accelerator.device)
+        time_tensor = torch.tensor(int(time.time()), device=self.accelerator.device)
         time_int = broadcast(time_tensor, 0).item()
         args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
-        self.local_seed = args.seed + accelerator.process_index * 100003
+        self.local_seed = args.seed + self.accelerator.process_index * 100003
         if args.num_sample_generations > 0:
             self.sample_generations_freq = max(1, num_training_steps // args.num_sample_generations)
 
@@ -243,7 +259,7 @@ class RLOOIndirectTrainer(Trainer):
         eval_dataloader = self.get_eval_dataloader(eval_dataset) if eval_dataset else None
 
         # Prepare model, optimizer, dataloaders with Accelerator
-        self.model, self.optimizer, self.lr_scheduler, train_dataloader, eval_dataloader = accelerator.prepare(
+        self.model, self.optimizer, self.lr_scheduler, train_dataloader, eval_dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.lr_scheduler, train_dataloader, eval_dataloader
         )
         self.train_dataloader = train_dataloader

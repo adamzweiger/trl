@@ -29,6 +29,13 @@ class RLOOIndirectConfig(TrainingArguments):
     reward function specified via a Python file path.
 
     Parameters:
+        model_name_or_path (`str`, *optional*, defaults to `None`):
+            Path to pretrained model or model identifier from huggingface.co/models.
+        trust_remote_code (`bool`, *optional*, defaults to `False`):
+            Whether to allow for custom models defined on the Hub in their own modeling files. This option should only
+            be set to `True` for repositories you trust and in which you have read the code, as it will execute code
+            present on the Hub on your local machine.
+
         > Parameters specific to RLOO Indirect training
 
         kl_coef (`float`, *optional*, defaults to `0.05`):
@@ -118,6 +125,13 @@ class RLOOIndirectConfig(TrainingArguments):
         stop_token_id (`int`, *optional*, defaults to `None`):
             Explicit token ID to use for truncating responses. Overrides `stop_token` if set.
     """
+
+    model_name_or_path: Optional[str] = field(default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"})
+    trust_remote_code: bool = field(default=False, metadata={"help": "Enable trusting remote code for tokenizer/model"})
+    torch_dtype: Optional[str] = field(
+        default=None, 
+        metadata={"help": "Override the default `torch.dtype` and load the model with another dtype. If 'auto', the dtype will be automatically derived from the model's weights."}
+    )
 
     # RLOO Specifics
     kl_coef: float = field(default=0.05, metadata={"help": "KL penalty coefficient."})
