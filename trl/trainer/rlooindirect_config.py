@@ -96,21 +96,6 @@ class RLOOIndirectConfig(TrainingArguments):
             Sampling temperature for generation. Higher values make the output more random. Lower values make it more deterministic.
         top_p (`float`, *optional*, defaults to `1.0`):
             If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or higher are kept for generation.
-        top_k (`int` or `None`, *optional*, defaults to `None`):
-            The number of highest probability vocabulary tokens to keep for top-k-filtering. If `None`, top-k is not applied.
-        max_lora_rank (`int`, *optional*, defaults to `64`):
-            The maximum LoRA rank to support in the vLLM engine. Should be >= `lora_rank`.
-
-        vllm_device (`str`, *optional*, defaults to `"auto"`):
-            Device where vLLM generation will run, e.g. `"cuda:1"`. If set to `"auto"` (default), the system will
-            automatically select the next available GPU after the last one used for training.
-        vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.9`):
-            Ratio (between 0 and 1) of GPU memory to reserve for the model weights, activations, and KV cache on the
-            device dedicated to generation powered by vLLM.
-        vllm_dtype (`str`, *optional*, defaults to `"auto"`):
-            Data type to use for vLLM generation (e.g., 'float16', 'bfloat16', 'auto').
-        vllm_max_model_len (`int` or `None`, *optional*, defaults to `None`):
-            Maximum sequence length supported by the vLLM engine. If `None`, uses the model's default.
 
         > Other Parameters
 
@@ -124,6 +109,15 @@ class RLOOIndirectConfig(TrainingArguments):
             If set to "eos", use the tokenizer's EOS token ID as the stop token for response truncation. Otherwise, this argument is ignored.
         stop_token_id (`int`, *optional*, defaults to `None`):
             Explicit token ID to use for truncating responses. Overrides `stop_token` if set.
+
+        adapter_save_dir (`str`, *optional*, defaults to `"./adapter_checkpoints"`):
+            Directory to save temporary adapters for vLLM requests. This directory will be created if it does not exist.
+        vllm_api_url (`str`, *optional*, defaults to `None`):
+            URL of the running vLLM OpenAI API server (e.g., http://localhost:8000). This is required for vLLM generation.
+        vllm_adapter_name (`str`, *optional*, defaults to `"dynamic_training_adapter"`):
+            The fixed name used when dynamically loading the adapter via the vLLM API. This is required for vLLM generation.
+        remove_unused_columns (`bool`, *optional*, defaults to `False`):
+            Whether to remove columns not required by the model's forward pass. If set to `True`, it will keep columns needed by the reward function (e.g., "target").
     """
 
     model_name_or_path: Optional[str] = field(default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"})
@@ -171,25 +165,18 @@ class RLOOIndirectConfig(TrainingArguments):
     max_completion_length: int = field(default=256, metadata={"help": "Maximum number of tokens to generate."})
     temperature: float = field(default=0.7, metadata={"help": "Sampling temperature."})
     top_p: float = field(default=1.0, metadata={"help": "Nucleus sampling probability."})
-    top_k: Optional[int] = field(default=None, metadata={"help": "Top-k sampling."})
-    max_lora_rank: int = field(default=64, metadata={"help": "Max LoRA rank for vLLM engine."})
 
-    # vLLM Engine Parameters
-    use_vllm: bool = field(default=True, metadata={"help": "Force use_vllm=True for this trainer."})
-    # vllm_device: str = field(
-    #     default="auto", metadata={"help": "Device for vLLM ('auto' or specific cuda device like 'cuda:1')."}
-    # )
-    vllm_num_gpus: int = field(
-        default=1, metadata={"help": "Number of GPUs to use for vLLM tensor parallelism."}
+    # vLLM 
+    vllm_api_url: Optional[str] = field(
+        default=None, metadata={"help": "URL of the running vLLM OpenAI API server (e.g., http://localhost:8000)."}
     )
-    vllm_start_gpu_index: int = field(
-        default=-1, metadata={"help": "The starting CUDA device index for vLLM. E.g., if using GPUs 2 and 3, set vllm_num_gpus=2 and vllm_start_gpu_index=2. Set to -1 for auto-detection (uses the first available GPU after training processes)."}
+    adapter_save_dir: Optional[str] = field(
+        default="./adapter_checkpoints", metadata={"help": "Directory to save temporary adapters for vLLM requests."}
     )
-    vllm_gpu_memory_utilization: float = field(
-        default=0.9, metadata={"help": "GPU memory utilization for vLLM."}
+    vllm_adapter_name: Optional[str] = field(
+        default="dynamic_training_adapter",
+        metadata={"help": "The fixed name used when dynamically loading the adapter via the vLLM API."}
     )
-    vllm_dtype: str = field(default="auto", metadata={"help": "Data type for vLLM ('auto', 'float16', 'bfloat16')."})
-    vllm_max_model_len: Optional[int] = field(default=None, metadata={"help": "Max model length for vLLM."})
 
     # Other config
     exp_name: str = field(default="rloo_indirect", metadata={"help": "Experiment name."})
@@ -210,21 +197,25 @@ class RLOOIndirectConfig(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__() # Call parent's post_init
-        if not self.use_vllm:
-            raise ValueError("RLOOIndirectTrainer requires use_vllm=True.")
         if self.rloo_k < 2:
             raise ValueError("rloo_k must be >= 2 for REINFORCE Leave-One-Out.")
         if self.reward_fn_path is None or not os.path.isfile(self.reward_fn_path):
             raise FileNotFoundError(f"Reward function file not found at path: {self.reward_fn_path}")
-        if self.lora_rank > self.max_lora_rank:
-            raise ValueError(f"lora_rank ({self.lora_rank}) cannot be greater than max_lora_rank ({self.max_lora_rank})")
-        if self.vllm_num_gpus <= 0:
-             raise ValueError("vllm_num_gpus must be positive.")
+        if self.vllm_api_url is None:
+            raise ValueError("vllm_api_url must be provided.")
+        if self.adapter_save_dir is None:
+            raise ValueError("adapter_save_dir must be provided.")
+        if self.vllm_adapter_name is None:
+            raise ValueError("vllm_adapter_name must be provided.")
 
-        # Adjust batch size for dataloader based on rloo_k
-        if self.per_device_train_batch_size % self.rloo_k != 0:
-             raise ValueError(f"per_device_train_batch_size ({self.per_device_train_batch_size}) must be divisible by rloo_k ({self.rloo_k})")
-        self.local_dataloader_batch_size = self.per_device_train_batch_size // self.rloo_k
+
+        # # Adjust batch size for dataloader based on rloo_k
+        # if self.per_device_train_batch_size % self.rloo_k != 0:
+        #      raise ValueError(f"per_device_train_batch_size ({self.per_device_train_batch_size}) must be divisible by rloo_k ({self.rloo_k})")
+        # self.local_dataloader_batch_size = self.per_device_train_batch_size // self.rloo_k
+        self.local_dataloader_batch_size = self.per_device_train_batch_size
+        print(f"Note: per_device_train_batch_size ({self.per_device_train_batch_size}) refers to the number of prompts per device.")
+
 
         # RLOO doesn't use PPO clipping
         # self.cliprange = 0.0 # Not used in RLOO loss
@@ -238,3 +229,6 @@ class RLOOIndirectConfig(TrainingArguments):
              self.remove_unused_columns = False # Temporarily disable to inspect dataset
         else:
              self._saved_remove_unused_columns = False
+
+        # Ensure adapter save dir exists (though Slurm script should also create it)
+        os.makedirs(self.adapter_save_dir, exist_ok=True)
