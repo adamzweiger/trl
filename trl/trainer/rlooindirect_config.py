@@ -176,8 +176,14 @@ class RLOOIndirectConfig(TrainingArguments):
 
     # vLLM Engine Parameters
     use_vllm: bool = field(default=True, metadata={"help": "Force use_vllm=True for this trainer."})
-    vllm_device: str = field(
-        default="auto", metadata={"help": "Device for vLLM ('auto' or specific cuda device like 'cuda:1')."}
+    # vllm_device: str = field(
+    #     default="auto", metadata={"help": "Device for vLLM ('auto' or specific cuda device like 'cuda:1')."}
+    # )
+    vllm_num_gpus: int = field(
+        default=1, metadata={"help": "Number of GPUs to use for vLLM tensor parallelism."}
+    )
+    vllm_start_gpu_index: int = field(
+        default=-1, metadata={"help": "The starting CUDA device index for vLLM. E.g., if using GPUs 2 and 3, set vllm_num_gpus=2 and vllm_start_gpu_index=2. Set to -1 for auto-detection (uses the first available GPU after training processes)."}
     )
     vllm_gpu_memory_utilization: float = field(
         default=0.9, metadata={"help": "GPU memory utilization for vLLM."}
@@ -212,6 +218,8 @@ class RLOOIndirectConfig(TrainingArguments):
             raise FileNotFoundError(f"Reward function file not found at path: {self.reward_fn_path}")
         if self.lora_rank > self.max_lora_rank:
             raise ValueError(f"lora_rank ({self.lora_rank}) cannot be greater than max_lora_rank ({self.max_lora_rank})")
+        if self.vllm_num_gpus <= 0:
+             raise ValueError("vllm_num_gpus must be positive.")
 
         # Adjust batch size for dataloader based on rloo_k
         if self.per_device_train_batch_size % self.rloo_k != 0:

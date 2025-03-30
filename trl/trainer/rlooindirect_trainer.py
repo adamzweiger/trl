@@ -21,6 +21,7 @@ import importlib.util
 import warnings
 from collections import defaultdict
 from typing import Callable, Optional, Union, Dict, Any, List
+import contextlib
 
 import numpy as np
 import pandas as pd
@@ -126,6 +127,7 @@ class RLOOIndirectTrainer(Trainer):
         config: RLOOIndirectConfig,
         processing_class: PreTrainedTokenizerBase,
         train_dataset: Dataset,
+        accelerator: Accelerator,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         data_collator: Optional[DataCollatorWithPadding] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
@@ -141,7 +143,7 @@ class RLOOIndirectTrainer(Trainer):
 
         if processing_class.padding_side != "left":
             raise ValueError("Tokenizer padding side must be 'left' for RLOOIndirectTrainer.")
-        self.processing_class = processing_class
+        # self.processing_class = processing_class
 
         # --- Model Initialization ---
         model_kwargs = {
@@ -172,12 +174,25 @@ class RLOOIndirectTrainer(Trainer):
 
         # --- Data Collator ---
         if data_collator is None:
-            data_collator = DataCollatorWithPadding(self.processing_class)
-        self.data_collator = data_collator
+            data_collator = DataCollatorWithPadding(processing_class)
+        # self.data_collator = data_collator
+
+        super().__init__(
+            model=self.model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )
+        print("hello4", self.optimizer)
+        print("hello5", self.lr_scheduler)
 
         # --- Dataset Handling ---
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
+        # self.train_dataset = train_dataset
+        # self.eval_dataset = eval_dataset
         self._validate_dataset_columns()
 
         # If remove_unused_columns was temporarily disabled, restore setting and maybe remove columns
@@ -192,16 +207,20 @@ class RLOOIndirectTrainer(Trainer):
         # --- Accelerator and Batch Sizes ---
         # accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
         # self.accelerator = accelerator
-        self.accelerator = Accelerator()
-        if hasattr(args, 'gradient_accumulation_steps') and self.accelerator.gradient_accumulation_steps != args.gradient_accumulation_steps:
-            warnings.warn(
-                f"Configuration mismatch: RLOOIndirectConfig specified gradient_accumulation_steps={args.gradient_accumulation_steps}, "
-                f"but Accelerator was initialized with gradient_accumulation_steps={self.accelerator.gradient_accumulation_steps}. "
-                f"Using the Accelerator's value.",
-                UserWarning
-            )
+        self.accelerator = accelerator
+        try:
+            # This reads accelerator.state.gradient_accumulation_steps, might still fail
+            if hasattr(config, 'gradient_accumulation_steps') and self.accelerator.gradient_accumulation_steps != config.gradient_accumulation_steps:
+                 warnings.warn(
+                     f"Configuration mismatch: RLOOIndirectConfig specified gradient_accumulation_steps={config.gradient_accumulation_steps}, "
+                     f"but Accelerator was initialized with gradient_accumulation_steps={self.accelerator.gradient_accumulation_steps}. "
+                     f"Using the Accelerator's value.",
+                     UserWarning
+                 )
+        except AttributeError as e:
+            warnings.warn(f"Could not check gradient_accumulation_steps during init: {e}", UserWarning)
 
-        args.world_size = self.accelerator.num_processes
+        print(f"[Process Index {self.args.process_index} (Local Rank {self.args.local_rank}) / World Size {self.args.world_size}] Trainer Init using self.args.")
 
         # Batch sizes need careful calculation based on dataloader batch size and k
         args.local_batch_size_per_step = args.per_device_train_batch_size * args.gradient_accumulation_steps
@@ -219,21 +238,23 @@ class RLOOIndirectTrainer(Trainer):
         args.num_training_steps = num_training_steps
         args.num_train_epochs = num_train_epochs
 
-        time_tensor = torch.tensor(int(time.time()), device=self.accelerator.device)
+        time_tensor = torch.tensor(int(time.time()), device=self.args.device)
         time_int = broadcast(time_tensor, 0).item()
         args.run_name = f"{args.exp_name}__{args.seed}__{time_int}"
-        self.local_seed = args.seed + self.accelerator.process_index * 100003
+        self.local_seed = args.seed + self.args.process_index * 100003
         if args.num_sample_generations > 0:
             self.sample_generations_freq = max(1, num_training_steps // args.num_sample_generations)
 
         # --- Optimizer and Scheduler ---
-        self.optimizer, self.lr_scheduler = optimizers
+        # self.optimizer, self.lr_scheduler = optimizers
         if self.optimizer is None:
-             # Create optimizer only for trainable PEFT parameters
              self.create_optimizer_and_scheduler(num_training_steps=num_training_steps)
 
+        print("hello6", self.optimizer)
+        print("hello7", self.lr_scheduler)
+
         # --- Trainer Internals (adapted from Trainer/RLOOTrainer) ---
-        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.is_fsdp_enabled = None
         # Disable dropout in policy model
         disable_dropout_in_model(self.model)
         if args.stop_token and args.stop_token == "eos":
@@ -259,44 +280,24 @@ class RLOOIndirectTrainer(Trainer):
         eval_dataloader = self.get_eval_dataloader(eval_dataset) if eval_dataset else None
 
         # Prepare model, optimizer, dataloaders with Accelerator
-        self.model, self.optimizer, self.lr_scheduler, train_dataloader, eval_dataloader = self.accelerator.prepare(
-            self.model, self.optimizer, self.lr_scheduler, train_dataloader, eval_dataloader
+        self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler = self.accelerator.prepare(
+            self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler
         )
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
 
-        # We need state and control objects for callbacks, logging etc.
-        self.state = OnlineTrainerState(
-            is_local_process_zero=self.is_local_process_zero(),
-            is_world_process_zero=self.is_world_process_zero(),
-            max_steps = num_training_steps // args.gradient_accumulation_steps, # Max steps for state/callbacks
-        )
-        self.control = TrainerControl()
-
-        # Callbacks
-        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
-        self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.callback_handler = CallbackHandler(
-            self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
-        )
-        self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
-        self.control = self.callback_handler.on_init_end(self.args, self.state, self.control)
-
         # Add PEFT model tags
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
-
-        # Other Trainer attributes needed
-        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
-        self.current_flos = 0 # Required by base class, not calculated here
-        self.hp_search_backend = None # Required by base class
-        self._signature_columns = ['input_ids', 'attention_mask', 'labels'] # Base needs this, may need adjustment
 
         # Create output directory if needed
         if self.is_world_process_zero():
             os.makedirs(args.output_dir, exist_ok=True)
             # Save PEFT config
             self.model.save_pretrained(args.output_dir) # Saves adapter_config.json etc.
+        
+        print(f"[Process Index {self.args.process_index}] RLOOIndirectTrainer initialization finished.")
+
 
     def _validate_dataset_columns(self):
         """Checks if train/eval datasets have 'prompt' and 'target' columns."""
@@ -324,59 +325,112 @@ class RLOOIndirectTrainer(Trainer):
     def _init_vllm(self):
         """Initializes the vLLM engine on the main process."""
         if not self.accelerator.is_main_process:
-            return # Only main process initializes vLLM
+            # Ensure non-main processes have llm=None if accessed accidentally
+            self.llm = None
+            self.sampling_params = None
+            return
 
         if self.llm is not None:
             return # Already initialized
 
         args = self.args
-        device_type = PartialState().default_device.type
-        device_module = getattr(torch, device_type)
-        vllm_device = args.vllm_device
+        num_gpus = args.vllm_num_gpus
+        start_index = args.vllm_start_gpu_index
 
-        if vllm_device == "auto":
-            if device_module.device_count() == 1:
-                vllm_device = f"{device_type}:0"
+        device_indices_str_list = []
+
+        if start_index == -1:
+            # Auto-detection logic
+            device_type = PartialState().default_device.type
+            device_module = getattr(torch, device_type)
+            total_gpus = device_module.device_count()
+            training_gpus = self.accelerator.num_processes
+
+            if total_gpus < training_gpus + num_gpus:
+                 raise ValueError(
+                     f"vLLM auto GPU selection failed: Not enough GPUs available. "
+                     f"Total GPUs: {total_gpus}, Training Processes: {training_gpus}, vLLM GPUs requested: {num_gpus}. "
+                     f"Need at least {training_gpus + num_gpus} total GPUs. "
+                     "Consider reducing training num_processes or vllm_num_gpus, or explicitly set vllm_start_gpu_index."
+                 )
+
+            # Use the GPUs immediately following the training GPUs
+            start_index = training_gpus
+            device_indices_str_list = [str(i) for i in range(start_index, start_index + num_gpus)]
+            print(f"[RLOOIndirectTrainer] vLLM 'auto' mode selected {num_gpus} GPU(s) starting at index {start_index}.")
+
+        elif start_index >= 0:
+            # Manual index logic
+            device_indices_str_list = [str(i) for i in range(start_index, start_index + num_gpus)]
+            print(f"[RLOOIndirectTrainer] Using specified vLLM start index {start_index} for {num_gpus} GPU(s).")
+            # Optional: Add a check if these indices overlap with training indices 0 to num_processes-1
+            training_indices = set(range(self.accelerator.num_processes))
+            vllm_indices = set(range(start_index, start_index + num_gpus))
+            if not training_indices.isdisjoint(vllm_indices):
+                 warnings.warn(
+                     f"Potential GPU overlap: Training uses indices {training_indices}, "
+                     f"vLLM is configured for indices {vllm_indices}. Ensure this is intended and sufficient VRAM is available.",
+                     UserWarning
+                 )
+        else:
+             raise ValueError(f"Invalid vllm_start_gpu_index: {start_index}. Must be >= -1.")
+
+
+        visible_devices_str = ",".join(device_indices_str_list)
+        print(f"[RLOOIndirectTrainer] Preparing vLLM for devices: {visible_devices_str} (TP size: {num_gpus})")
+
+        # --- Temporarily modify environment on rank 0 ---
+        original_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        print(f"[RLOOIndirectTrainer] Original CUDA_VISIBLE_DEVICES='{original_visible_devices}'")
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices_str
+        print(f"[RLOOIndirectTrainer] Set CUDA_VISIBLE_DEVICES='{visible_devices_str}' for vLLM init.")
+
+        try:
+            self.llm = LLM(
+                model=self.model.base_model.config._name_or_path, # Use base model path
+                tensor_parallel_size=num_gpus,                    # Use parsed TP size
+                device="cuda",                                    # Just specify the type
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                dtype=args.vllm_dtype,
+                max_model_len=args.vllm_max_model_len,
+                enable_lora=True,
+                max_lora_rank=args.max_lora_rank,
+                trust_remote_code=getattr(args, "trust_remote_code", False),
+                download_dir=os.environ.get("HF_HOME", None),
+            )
+            print(f"[RLOOIndirectTrainer] vLLM Engine initialized successfully.")
+
+        except Exception as e:
+            print(f"[RLOOIndirectTrainer] !!! vLLM Initialization Failed !!!")
+            print(f"  Attempted CUDA_VISIBLE_DEVICES='{visible_devices_str}'")
+            print(f"  Tensor Parallel Size: {num_gpus}")
+            print(f"  Base Model: {self.model.base_model.config._name_or_path}")
+            print(f"  Error: {e}")
+            # Ensure environment is restored even on error before raising
+            if original_visible_devices is None:
+                if "CUDA_VISIBLE_DEVICES" in os.environ: del os.environ["CUDA_VISIBLE_DEVICES"]
             else:
-                 # Find first unused device or use the last device if all are used by Accelerate
-                used_devices = {f"{device_type}:{idx}" for idx in range(self.accelerator.num_processes)}
-                available_devices = {f"{device_type}:{idx}" for idx in range(device_module.device_count())}
-                free_devices = list(available_devices - used_devices)
-                if free_devices:
-                    vllm_device = free_devices[0]
-                else:
-                     vllm_device = f"{device_type}:{self.accelerator.num_processes - 1}" # Fallback to last training GPU
-                     warnings.warn(
-                        f"All GPUs seem occupied by Accelerate. Placing vLLM on {vllm_device}. "
-                        "This might lead to OOM errors. Consider reducing num_processes for training."
-                    )
-        elif vllm_device in {f"{device_type}:{idx}" for idx in range(self.accelerator.num_processes)}:
-             warnings.warn(
-                 f"vLLM device {vllm_device} is also used for training. Ensure sufficient VRAM or use a dedicated device."
-             )
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+            raise # Re-raise the exception
+        finally:
+            # --- Restore original environment ---
+            if original_visible_devices is None:
+                # If it wasn't set before, remove it
+                if "CUDA_VISIBLE_DEVICES" in os.environ:
+                    del os.environ["CUDA_VISIBLE_DEVICES"]
+                    print(f"[RLOOIndirectTrainer] Unset CUDA_VISIBLE_DEVICES.")
+            else:
+                # Otherwise, restore the original value
+                os.environ["CUDA_VISIBLE_DEVICES"] = original_visible_devices
+                print(f"[RLOOIndirectTrainer] Restored CUDA_VISIBLE_DEVICES='{original_visible_devices}'.")
 
-        print(f"[RLOOIndirectTrainer] Initializing vLLM on device: {vllm_device}")
-        self.llm = LLM(
-            model=self.model.base_model.config._name_or_path, # Use base model path
-            device=vllm_device.split(':')[-1], # vLLM expects device index or list
-            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            dtype=args.vllm_dtype,
-            max_model_len=args.vllm_max_model_len,
-            # Crucial for LoRA:
-            enable_lora=True,
-            max_lora_rank=args.max_lora_rank,
-            trust_remote_code=getattr(args, "trust_remote_code", False),
-            download_dir=os.environ.get("HF_HOME", None)
-        )
-
+        # Initialize sampling params (outside the try/finally)
         self.sampling_params = SamplingParams(
             n=1, # Generate 1 completion per request (we repeat requests k times)
             max_tokens=args.max_completion_length,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k if args.top_k is not None else -1,
-            # stop_token_ids=[self.processing_class.eos_token_id] # Add EOS stop token
-            # Add other sampling params if needed
         )
         if self.processing_class.eos_token_id is not None:
              self.sampling_params.stop_token_ids = [self.processing_class.eos_token_id]
