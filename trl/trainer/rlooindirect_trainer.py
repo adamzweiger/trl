@@ -256,7 +256,6 @@ class RLOOIndirectTrainer(Trainer):
         # --- Final Accelerator Preparation ---
         train_dataloader = self.get_train_dataloader()
         eval_dataloader = self.get_eval_dataloader(eval_dataset) if eval_dataset else None
-        print("hello0")
 
 
         # Prepare model, optimizer, dataloaders with Accelerator
@@ -266,7 +265,6 @@ class RLOOIndirectTrainer(Trainer):
         self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler = self.accelerator.prepare(
             self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler
         )
-        print("hello10")
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
 
@@ -478,6 +476,21 @@ class RLOOIndirectTrainer(Trainer):
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
+        # run a get models request
+        models_endpoint = f"{self.vllm_api_url}/v1/models"
+        try:
+            response = requests.get(models_endpoint, timeout=10) # Add a timeout
+            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+
+            print(f"Status Code: {response.status_code}")
+            print("Response JSON:")
+            print(response.json()) # vLLM should return JSON data
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error making request to {models_endpoint}: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
         # --- Training Loop ---
         for step in range(max_steps):
             all_query_ids_list = []
@@ -512,7 +525,9 @@ class RLOOIndirectTrainer(Trainer):
                 accelerator.wait_for_everyone() # Ensure save completes
 
                 # 2. Load adapter into vLLM server via API (main process)
-                adapter_loaded = self._load_adapter_via_api(self.adapter_save_path, self.vllm_adapter_name)
+                # set path to adapter_save_path + /outer_lora
+                outer_lora_path = os.path.join(self.adapter_save_path, LORA_ADAPTER_NAME)
+                adapter_loaded = self._load_adapter_via_api(outer_lora_path, self.vllm_adapter_name)
                 # Broadcast success/failure? For now, assume it works or fails globally after wait.
                 adapter_loaded_tensor = torch.tensor(1 if adapter_loaded else 0, device=device)
                 adapter_loaded_tensor = broadcast(adapter_loaded_tensor)
@@ -963,7 +978,8 @@ class RLOOIndirectTrainer(Trainer):
              print(f"Using current training adapter: {adapter_path_to_load}")
 
          # Load the chosen adapter via API
-         if not self._load_adapter_via_api(adapter_path_to_load, adapter_name_to_use):
+         outer_lora_path = os.path.join(adapter_path_to_load, LORA_ADAPTER_NAME)
+         if not self._load_adapter_via_api(outer_lora_path, adapter_name_to_use):
              print(f"Error: Failed to load adapter '{adapter_name_to_use}' for evaluation. Skipping generation.")
              return
 
