@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, PartialState
-from accelerate.utils import broadcast, gather_object, pad_across_processes, reduce
+from accelerate.utils import broadcast_object_list, broadcast, gather_object, pad_across_processes, reduce
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import (
@@ -46,7 +46,7 @@ from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
 from transformers.utils import is_peft_available
 
-from ..models.utils import unwrap_model_for_generation # Keep potentially useful utils
+from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
     OnlineTrainerState,
     # batch_generation, # Replaced by vLLM
@@ -72,7 +72,7 @@ if is_wandb_available():
     import wandb
 
 INVALID_LOGPROB = 1.0
-LORA_ADAPTER_NAME = "outer_lora" # Fixed name for the adapter we train
+LORA_ADAPTER_NAME = "outer_lora" # Name of the LoRA adapter to be trained with RL
 
 
 # Type hint for the external reward function
@@ -127,7 +127,6 @@ class RLOOIndirectTrainer(Trainer):
 
         if processing_class.padding_side != "left":
             raise ValueError("Tokenizer padding side must be 'left' for RLOOIndirectTrainer.")
-        # self.processing_class = processing_class
 
         # --- Model Initialization ---
         model_kwargs = {
@@ -159,7 +158,6 @@ class RLOOIndirectTrainer(Trainer):
         # --- Data Collator ---
         if data_collator is None:
             data_collator = DataCollatorWithPadding(processing_class)
-        # self.data_collator = data_collator
 
         super().__init__(
             model=self.model,
@@ -173,8 +171,6 @@ class RLOOIndirectTrainer(Trainer):
         )
 
         # --- Dataset Handling ---
-        # self.train_dataset = train_dataset
-        # self.eval_dataset = eval_dataset
         self._validate_dataset_columns()
 
         # If remove_unused_columns was temporarily disabled, restore setting and maybe remove columns
@@ -187,11 +183,8 @@ class RLOOIndirectTrainer(Trainer):
 
 
         # --- Accelerator and Batch Sizes ---
-        # accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-        # self.accelerator = accelerator
         self.accelerator = accelerator
         try:
-            # This reads accelerator.state.gradient_accumulation_steps, might still fail
             if hasattr(config, 'gradient_accumulation_steps') and self.accelerator.gradient_accumulation_steps != config.gradient_accumulation_steps:
                  warnings.warn(
                      f"Configuration mismatch: RLOOIndirectConfig specified gradient_accumulation_steps={config.gradient_accumulation_steps}, "
@@ -205,12 +198,23 @@ class RLOOIndirectTrainer(Trainer):
         print(f"[Process Index {self.args.process_index} (Local Rank {self.args.local_rank}) / World Size {self.args.world_size}] Trainer Init using self.args.")
 
         # --- Batch Sizes & Steps Calculation ---
-        # Note: args.local_dataloader_batch_size is now #prompts per device
-        # Total samples per update involves rloo_k
-        args.total_samples_per_update = args.local_dataloader_batch_size * args.world_size * args.gradient_accumulation_steps * args.rloo_k
-        args.local_batch_size_per_step = args.local_dataloader_batch_size * args.gradient_accumulation_steps # Num prompts per device per optimizer step
-        args.effective_batch_size = args.local_dataloader_batch_size * args.world_size # Num prompts per global step
-        args.total_batch_size_per_update = args.local_batch_size_per_step * args.world_size # Total prompts per optimizer update
+        # Note: args.per_device_train_batch_size is #prompts per device per micro-step
+        # local_dataloader_batch_size is #prompts per device per dataloader fetch
+        # Ensure consistency if gradient_accumulation_steps > 1
+        if args.gradient_accumulation_steps > 1 and args.local_dataloader_batch_size != args.per_device_train_batch_size:
+             warnings.warn(
+                 f"RLOOIndirectConfig.local_dataloader_batch_size ({args.local_dataloader_batch_size}) "
+                 f"!= RLOOIndirectConfig.per_device_train_batch_size ({args.per_device_train_batch_size}). "
+                 f"Setting local_dataloader_batch_size = per_device_train_batch_size for simplicity "
+                 f"when gradient_accumulation_steps > 1.", UserWarning
+             )
+             args.local_dataloader_batch_size = args.per_device_train_batch_size
+        # Total samples per optimizer update = #prompts/dev * #devs * #accum_steps * k
+        args.total_samples_per_update = args.per_device_train_batch_size * args.world_size * args.gradient_accumulation_steps * args.rloo_k
+        # Total prompts per optimizer update = #prompts/dev * #devs * #accum_steps
+        args.total_prompts_per_update = args.per_device_train_batch_size * args.world_size * args.gradient_accumulation_steps
+        # Effective batch size (prompts per global step before accumulation)
+        args.effective_prompt_batch_size = args.per_device_train_batch_size * args.world_size
 
         # Calculate total training steps
         if args.max_steps > 0:
@@ -232,12 +236,11 @@ class RLOOIndirectTrainer(Trainer):
             self.sample_generations_freq = max(1, num_training_steps // args.num_sample_generations)
 
         # --- Optimizer and Scheduler ---
-        # self.optimizer, self.lr_scheduler = optimizers
         if self.optimizer is None:
              self.create_optimizer_and_scheduler(num_training_steps=num_training_steps)
 
         # --- Trainer Internals (adapted from Trainer/RLOOTrainer) ---
-        self.is_fsdp_enabled = None
+        self.is_fsdp_enabled = None # Could set later after .prepare
         # Disable dropout in policy model
         disable_dropout_in_model(self.model)
         if args.stop_token and args.stop_token == "eos":
@@ -256,7 +259,6 @@ class RLOOIndirectTrainer(Trainer):
         # --- Final Accelerator Preparation ---
         train_dataloader = self.get_train_dataloader()
         eval_dataloader = self.get_eval_dataloader(eval_dataset) if eval_dataset else None
-
 
         # Prepare model, optimizer, dataloaders with Accelerator
         print(f"[Rank {self.accelerator.process_index}] ENV: MASTER_ADDR={os.environ.get('MASTER_ADDR')} MASTER_PORT={os.environ.get('MASTER_PORT')} RANK={os.environ.get('RANK')} WORLD_SIZE={os.environ.get('WORLD_SIZE')} LOCAL_RANK={os.environ.get('LOCAL_RANK')}")
@@ -286,7 +288,6 @@ class RLOOIndirectTrainer(Trainer):
                  print(f"Warning: Could not save initial PEFT config: {e}")
         
         print(f"[Process Index {self.args.process_index}] RLOOIndirectTrainer initialization finished.")
-
 
     def _validate_dataset_columns(self):
         """Checks if train/eval datasets have 'prompt' and 'target' columns."""
@@ -466,17 +467,19 @@ class RLOOIndirectTrainer(Trainer):
         num_update_steps_per_epoch = math.ceil( len(self.train_dataset) / (args.local_dataloader_batch_size * args.world_size * args.gradient_accumulation_steps) )
         max_steps = args.num_training_steps
 
-        print(f"  Num prompt examples = {len(self.train_dataset)}")
-        print(f"  Num Epochs = {args.num_train_epochs:.2f}")
-        print(f"  Instantaneous batch size per device (# prompts) = {args.per_device_train_batch_size}")
-        print(f"  Total train batch size (# prompts per update) = {args.total_batch_size_per_update}")
-        print(f"  Total train batch size (# samples per update) = {total_train_samples_per_update}")
-        print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-        print(f"  Total optimization steps = {max_steps}")
+        accelerator.print(f"  Num prompt examples = {len(self.train_dataset)}")
+        accelerator.print(f"  Num Epochs = {args.num_train_epochs:.2f}")
+        accelerator.print(f"  Instantaneous batch size per device (# prompts) = {args.per_device_train_batch_size}")
+        accelerator.print(f"  Total train batch size (# prompts per global step) = {args.effective_prompt_batch_size}")
+        accelerator.print(f"  Total train batch size (# prompts per optimizer update) = {args.total_prompts_per_update}")
+        accelerator.print(f"  Total train samples (# completions per optimizer update) = {args.total_samples_per_update}")
+        accelerator.print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+        accelerator.print(f"  Total optimization steps = {max_steps}")
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
-        # run a get models request
+        # Get models endpoint
+        # This is just to check if the API is reachable and working
         models_endpoint = f"{self.vllm_api_url}/v1/models"
         try:
             response = requests.get(models_endpoint, timeout=10) # Add a timeout
@@ -493,47 +496,43 @@ class RLOOIndirectTrainer(Trainer):
 
         # --- Training Loop ---
         for step in range(max_steps):
-            all_query_ids_list = []
-            all_response_ids_list = []
-            all_logprobs_list = []
-            all_ref_logprobs_list = []
-            all_scores_list = []
-            all_advantages_list = []
-            all_sequence_lengths_list = []
-            all_kl_list = []
-            all_rlhf_rewards_list = []
-            all_non_score_rewards_list = []
-            approxkl_stats_accum = []
-            pg_loss_stats_accum = []
-            entropy_stats_accum = []
-            ratio_stats_accum = []
+            step_start_time = time.time()
+            # Placeholders for data accumulated over gradient accumulation steps
+            # Store on CPU to save GPU memory, move to GPU during optimization phase
+            all_query_ids_list_cpu = []
+            all_response_ids_list_cpu = []
+            all_ref_logprobs_sum_list_cpu = []
+            all_scores_list_cpu = []
+            all_sequence_lengths_list_cpu = []
 
-            # --- Experience Generation Phase ---
-            # Accumulate gradients for args.gradient_accumulation_steps
+            # --- Experience Generation Phase (Accumulate gradients) ---
             for micro_step in range(args.gradient_accumulation_steps):
-                # Get batch: keys 'input_ids', 'attention_mask', 'prompt', 'target'
-                # Batch size is local_dataloader_batch_size (# prompts)
+                micro_step_start_time = time.time()
+                # Get batch for this micro-step (local batch size = per_device_train_batch_size)
+                # Keys: 'input_ids', 'attention_mask', 'prompt', 'target'
                 raw_batch = next(iter_dataloader)
-                prompts_data = raw_batch['input_ids'].to(device) # Shape: (local_bs, prompt_len)
-                targets = raw_batch['target'] # List of targets, len = local_bs
+                print(f"Process {accelerator.process_index} got batch: {raw_batch["prompt"]}")
+                local_prompts_ids = raw_batch['input_ids'] # Shape: (local_bs, prompt_len)
+                local_prompts_text = raw_batch['prompt']   # List of strings, len = local_bs
+                local_targets = raw_batch['target']       # List of targets, len = local_bs
+                local_bs = len(local_prompts_text)
 
                 # --- vLLM Generation via API ---
                 # 1. Save current adapter state (main process)
                 if accelerator.is_main_process:
                     unwrapped_model = accelerator.unwrap_model(self.model)
                     unwrapped_model.save_pretrained(self.adapter_save_path)
-                accelerator.wait_for_everyone() # Ensure save completes
+                accelerator.wait_for_everyone() # Ensure save completes before API call
 
                 # 2. Load adapter into vLLM server via API (main process)
-                # set path to adapter_save_path + /outer_lora
                 outer_lora_path = os.path.join(self.adapter_save_path, LORA_ADAPTER_NAME)
                 adapter_loaded = self._load_adapter_via_api(outer_lora_path, self.vllm_adapter_name)
-                # Broadcast success/failure? For now, assume it works or fails globally after wait.
                 adapter_loaded_tensor = torch.tensor(1 if adapter_loaded else 0, device=device)
-                adapter_loaded_tensor = broadcast(adapter_loaded_tensor)
+                if accelerator.num_processes > 1:
+                     broadcast(adapter_loaded_tensor, from_process=0)
                 if adapter_loaded_tensor.item() == 0:
                     raise RuntimeError(f"Failed to load adapter '{self.vllm_adapter_name}' into vLLM server. Stopping training.")
-                accelerator.wait_for_everyone() # Ensure load call finishes everywhere
+                # No need for wait_for_everyone here, broadcast synchronizes
 
                 # 3. Prepare API request parameters
                 sampling_params_dict = {
@@ -543,308 +542,374 @@ class RLOOIndirectTrainer(Trainer):
                     "top_p": args.top_p,
                     "stop": [self.processing_class.eos_token] if args.stop_token_id == self.processing_class.eos_token_id else [], # Add other stop strings if needed
                 }
-                # Decode prompts for API
-                prompts_text = self.processing_class.batch_decode(prompts_data, skip_special_tokens=True)
 
-                # 4. Generate using vLLM API (main process calls, result broadcasted)
-                # Result is flat list: [p0_s0, p0_s1.., p1_s0, p1_s1.., ...] size = local_bs * k
-                generated_responses_text = self._generate_via_vllm_api(
-                    prompts_text,
-                    self.vllm_adapter_name,
-                    sampling_params_dict
-                )
-                # Broadcast results (necessary if only main process called API)
-                generated_responses_text = gather_object(generated_responses_text) # Gather from all processes (even if only main had data)
-                # Filter out potential empty strings from non-main processes if broadcast was used instead of gather_object
-                # If using gather_object, main process has the full list
+                # 4. Generate using vLLM API (Gather prompts, main generates, broadcast results)
+                # Gather prompts from all processes onto the main process
+                all_prompts_text_gathered = gather_object(local_prompts_text)
+                # Expected size on main process: world_size * local_bs
+                print(f"Process {accelerator.process_index} gathered {len(all_prompts_text_gathered)} prompts: {all_prompts_text_gathered}")
+
+                flat_generated_responses_text_global = []
+                global_num_prompts = args.effective_prompt_batch_size # world_size * local_bs
+                expected_global_completions = global_num_prompts * args.rloo_k
+
                 if accelerator.is_main_process:
-                    # Flatten the list of lists gathered
-                    flat_generated_responses_text = []
-                    for sublist in generated_responses_text:
-                        flat_generated_responses_text.extend(sublist)
-                    generated_responses_text = flat_generated_responses_text
+                    # Flatten the gathered list of lists of prompts
+                    flat_prompts_global = []
+                    for sublist in all_prompts_text_gathered:
+                        flat_prompts_global.extend(sublist)
+
+                    print(f"Process {accelerator.process_index} flattened gathered prompts: {flat_prompts_global}")
+
+                    if len(flat_prompts_global) != global_num_prompts:
+                         raise RuntimeError(f"Gathered prompt list has wrong size on main process. Got {len(flat_prompts_global)}, expected {global_num_prompts}")
+
+                    # Main process calls API with all prompts
+                    flat_generated_responses_text_global = self._generate_via_vllm_api(
+                        flat_prompts_global,
+                        self.vllm_adapter_name,
+                        sampling_params_dict
+                    )
+                    if len(flat_generated_responses_text_global) != expected_global_completions:
+                         raise RuntimeError(f"vLLM API returned wrong number of completions. Got {len(flat_generated_responses_text_global)}, expected {expected_global_completions}")
                 else:
-                    generated_responses_text = [""] * args.effective_batch_size * args.rloo_k # Placeholder size
+                    # Non-main processes need a placeholder list of the correct *global* size for broadcast
+                    flat_generated_responses_text_global = [""] * expected_global_completions
+                print(f"Process {accelerator.process_index} generated {len(flat_generated_responses_text_global)} completions: {flat_generated_responses_text_global}")
+                # Broadcast the complete list of generated texts from main process to all
+                if accelerator.num_processes > 1:
+                     broadcast_object_list(flat_generated_responses_text_global, from_process=0)
+                # Now, flat_generated_responses_text_global (the full list) is available on all processes
+                print(f"Process {accelerator.process_index} received {len(flat_generated_responses_text_global)} completions after broadcast: {flat_generated_responses_text_global}")
 
-                # Broadcast the final list from main process
-                generated_responses_text = broadcast(generated_responses_text)
+                # --- Process Generated Responses (Locally) ---
+                # 5. Slice the global list to get texts corresponding to this process's prompts
+                local_start_idx = accelerator.process_index * local_bs * args.rloo_k
+                local_end_idx = local_start_idx + local_bs * args.rloo_k
+                local_generated_responses_text = flat_generated_responses_text_global[local_start_idx:local_end_idx]
+                print(f"Process {accelerator.process_index} sliced {len(local_generated_responses_text)} completions for local batch: {local_start_idx}:{local_end_idx}")
 
-                # --- Process Generated Responses ---
-                # 5. Tokenize responses
-                # Shape: (global_bs * k, resp_len) - Need to handle on each process
-                # Each process receives the full list of generated texts
-                local_start_index = accelerator.process_index * args.local_dataloader_batch_size * args.rloo_k
-                local_end_index = local_start_index + args.local_dataloader_batch_size * args.rloo_k
-                local_generated_responses_text = generated_responses_text[local_start_index:local_end_index]
-
+                # 6. Tokenize the local responses
+                # Shape: (local_bs * k, resp_len)
                 responses_tokenized = self.processing_class(
                     local_generated_responses_text,
-                    padding='longest',
+                    padding='longest', # Pad to longest response *in this local batch*
                     truncation=True,
                     max_length=args.max_completion_length,
                     return_tensors="pt",
                 ).to(device)
-                responses_ids = responses_tokenized.input_ids # Shape: (local_bs * k, resp_len)
+                local_responses_ids = responses_tokenized.input_ids
 
-                # Remove potential leading BOS token
-                if self.processing_class.bos_token_id is not None and responses_ids.shape[1] > 0:
-                    if (responses_ids[:, 0] == self.processing_class.bos_token_id).all():
-                         responses_ids = responses_ids[:, 1:]
+                # Remove potential leading BOS token if tokenizer adds it
+                if self.processing_class.bos_token_id is not None and local_responses_ids.shape[1] > 0:
+                    if (local_responses_ids[:, 0] == self.processing_class.bos_token_id).all():
+                         local_responses_ids = local_responses_ids[:, 1:]
 
-                # Truncate at stop token
-                processed_responses_ids = responses_ids
-                if args.stop_token_id is not None:
-                    processed_responses_ids = truncate_response(
-                        args.stop_token_id, self.processing_class.pad_token_id, responses_ids
+                # Truncate at stop token (if specified and different from EOS handled by padding)
+                # Note: vLLM API's `stop` parameter should ideally handle this, but we can double-check.
+                local_processed_responses_ids = local_responses_ids
+                if args.stop_token_id is not None and args.stop_token_id != self.processing_class.pad_token_id:
+                    local_processed_responses_ids = truncate_response(
+                        args.stop_token_id, self.processing_class.pad_token_id, local_responses_ids
                     ) # Shape: (local_bs * k, proc_resp_len)
 
-                # --- Log Prob Calculation ---
-                # Repeat original prompts k times for logprob calculation
-                queries_repeated = prompts_data.repeat_interleave(args.rloo_k, dim=0) # Shape: (local_bs * k, prompt_len)
-                context_length = queries_repeated.shape[1]
+                # --- Log Prob Calculation (Requires Reference Model) ---
+                # Repeat original local prompts k times for logprob calculation
+                local_queries_repeated = local_prompts_ids.repeat_interleave(args.rloo_k, dim=0) # Shape: (local_bs * k, prompt_len)
+                local_context_length = local_queries_repeated.shape[1]
 
-                # Construct full input sequences (query + response)
-                query_responses_ids = torch.cat([queries_repeated, processed_responses_ids], dim=1)
-                # Create attention mask
-                query_mask = torch.ones_like(queries_repeated)
-                resp_padding_mask = (processed_responses_ids == self.processing_class.pad_token_id)
-                resp_attn_mask = ~resp_padding_mask
-                query_responses_mask = torch.cat([query_mask, resp_attn_mask], dim=1)
+                # Construct full input sequences (query + response) for logprob calculation
+                local_query_responses_ids = torch.cat([local_queries_repeated, local_processed_responses_ids], dim=1)
+                # Create attention mask for the combined sequence
+                local_query_mask = torch.ones_like(local_queries_repeated, device=device) # Assume query part is never padded
+                # Mask needs to cover padding in the response part
+                local_resp_attn_mask = (local_processed_responses_ids != self.processing_class.pad_token_id).long()
+                local_query_responses_mask = torch.cat([local_query_mask, local_resp_attn_mask], dim=1)
 
-                # Need logprobs from *current* model state (before optimizer step)
-                # Use torch.no_grad() for reference model, but not for policy model if inside accumulation context?
-                # Policy logprobs (adapter enabled) - Calculate outside no_grad context if using accumulate
-                # Reference logprobs (adapter disabled) - Calculate inside no_grad context
-
+                # Calculate reference logprobs (adapter disabled) using torch.no_grad()
                 with torch.no_grad():
-                     # Reference logprobs (adapter disabled)
-                     with accelerator.unwrap_model(self.model).disable_adapter():
-                         ref_outputs = forward(self.model, query_responses_ids, query_responses_mask)
-                         ref_logits = ref_outputs.logits[:, context_length - 1 : -1]
-                         ref_logits /= args.temperature + 1e-7 # Apply temperature? Yes, consistency.
-                         ref_logprobs = selective_log_softmax(ref_logits, processed_responses_ids)
+                     # Ensure the model is in eval mode for ref logprobs if it has dropout/batchnorm layers
+                     # self.model.eval() # Potentially needed if base model has dropout
+                     # Disable adapter context manager
+                     with self.accelerator.unwrap_model(self.model).disable_adapter():
+                         ref_outputs = forward(self.model, local_query_responses_ids, local_query_responses_mask)
+                         # Slice logits corresponding to the response tokens only
+                         ref_logits = ref_outputs.logits[:, local_context_length - 1 : -1]
+                         # Apply temperature scaling (consistent with generation/policy calculation)
+                         ref_logits /= args.temperature + 1e-7
+                         # Calculate log softmax for the actual response tokens
+                         local_ref_logprobs = selective_log_softmax(ref_logits, local_processed_responses_ids)
                          del ref_outputs, ref_logits
                          torch.cuda.empty_cache()
+                     # self.model.train() # Switch back to train mode if changed
 
-                # Policy logprobs (adapter enabled) - Calculated later during loss computation with grads enabled
+                # --- Reward Calculation (Local) ---
+                # Decode processed responses for the reward function
+                local_processed_responses_text = self.processing_class.batch_decode(
+                    local_processed_responses_ids, skip_special_tokens=True
+                )
+                local_scores = torch.zeros(local_bs * args.rloo_k, device=device, dtype=torch.float)
 
-                # --- Reward Calculation ---
-                processed_responses_text = self.processing_class.batch_decode(processed_responses_ids, skip_special_tokens=True)
-                scores = torch.zeros(args.local_dataloader_batch_size * args.rloo_k, device=device, dtype=torch.float)
-
-                # Call reward function for each original prompt
+                # Call reward function for each original prompt in the local batch
                 current_idx = 0
-                # Original prompts text already decoded: prompts_text (len = local_bs)
-                for i in range(args.local_dataloader_batch_size):
-                     prompt_text = prompts_text[i]
-                     target = targets[i]
-                     k_completions = processed_responses_text[current_idx : current_idx + args.rloo_k]
+                for i in range(local_bs):
+                     prompt_text = local_prompts_text[i]
+                     target = local_targets[i]
+                     # Get the k completions generated for this specific prompt
+                     k_completions = local_processed_responses_text[current_idx : current_idx + args.rloo_k]
 
                      # Call external reward function
-                     import inspect
-                     sig = inspect.signature(self.reward_fn)
-                     reward_kwargs = self.reward_fn_kwargs.copy()
-                     # No LLM object to pass anymore
-                     # if 'llm' in sig.parameters: reward_kwargs['llm'] = None # Or remove if not needed
-                     if 'target' in sig.parameters: reward_kwargs['target'] = target
+                     try:
+                         import inspect
+                         sig = inspect.signature(self.reward_fn)
+                         reward_kwargs = self.reward_fn_kwargs.copy()
+                         # Pass target if the function expects it
+                         if 'target' in sig.parameters: reward_kwargs['target'] = target
+                         # Warn/remove 'llm' if expected but not provided
+                         if 'llm' in sig.parameters:
+                             warnings.warn("Reward function expects 'llm' argument, but it's no longer provided when using vLLM API.", UserWarning, stacklevel=2)
+                             reward_kwargs.pop('llm', None)
 
-                     # Check if reward_fn still expects 'llm'
-                     if 'llm' in sig.parameters:
-                         warnings.warn("Reward function expects 'llm' argument, but it's no longer provided when using vLLM API.", UserWarning)
-                         # Remove llm from kwargs if present to avoid error
-                         reward_kwargs.pop('llm', None)
+                         k_scores_list = self.reward_fn(
+                             prompt_text=prompt_text,
+                             completions_text=k_completions,
+                             **reward_kwargs
+                         )
+                     except Exception as e:
+                          print(f"Error calling reward function for prompt: {prompt_text[:100]}...")
+                          print(f"Completions: {k_completions}")
+                          print(f"Kwargs: {reward_kwargs}")
+                          raise e
 
 
-                     k_scores = self.reward_fn(
-                         prompt_text=prompt_text,
-                         completions_text=k_completions,
-                         **reward_kwargs
-                     )
+                     if not isinstance(k_scores_list, list) or len(k_scores_list) != args.rloo_k:
+                         raise ValueError(f"Reward function must return a list of {args.rloo_k} floats. Got: {k_scores_list}")
 
-                     if not isinstance(k_scores, list) or len(k_scores) != args.rloo_k:
-                         raise ValueError(f"Reward function must return a list of {args.rloo_k} floats.")
+                     # Ensure scores are floats before converting to tensor
+                     try:
+                         k_scores_float = [float(s) for s in k_scores_list]
+                     except (ValueError, TypeError) as e:
+                          raise ValueError(f"Reward function must return floats. Got: {k_scores_list}. Error: {e}")
 
-                     scores[current_idx : current_idx + args.rloo_k] = torch.tensor(k_scores, device=device, dtype=torch.float)
+                     local_scores[current_idx : current_idx + args.rloo_k] = torch.tensor(k_scores_float, device=device, dtype=torch.float)
                      current_idx += args.rloo_k
 
-                # Post-process scores
-                contain_eos_token = torch.any(processed_responses_ids == self.processing_class.eos_token_id, dim=-1)
+                # Post-process scores (e.g., missing EOS penalty)
+                # Need to check against pad token ID since EOS might be replaced by pad during truncate_response
+                # Or check the original local_responses_ids before potential truncation? Let's use processed.
+                # A safer check might be if the sequence length is less than max_completion_length
+                sequence_length_for_eos_check = first_true_indices(local_processed_responses_ids == self.processing_class.pad_token_id) -1
+                # Check if EOS is present *before* padding begins
+                contain_eos_token = torch.any(
+                    (local_processed_responses_ids == self.processing_class.eos_token_id) &
+                    (torch.arange(local_processed_responses_ids.shape[1], device=device) <= sequence_length_for_eos_check.unsqueeze(1)),
+                    dim=1
+                )
+                # Alternative: Check if generation stopped early (length < max) - less reliable if max_tokens hit
+                # stopped_early = sequence_length_for_eos_check < (args.max_completion_length -1)
+
                 if args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= args.missing_eos_penalty
+                    local_scores[~contain_eos_token] -= args.missing_eos_penalty
 
-                # Create padding mask for logprobs
-                sequence_lengths = first_true_indices(processed_responses_ids == self.processing_class.pad_token_id) - 1
-                response_idxs = torch.arange(processed_responses_ids.shape[1], device=device).repeat(processed_responses_ids.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
+                # --- Prepare data for storage ---
+                # Create padding mask for logprobs based on actual generated length before padding
+                local_sequence_lengths = first_true_indices(local_processed_responses_ids == self.processing_class.pad_token_id) - 1
+                response_idxs = torch.arange(local_processed_responses_ids.shape[1], device=device).repeat(local_processed_responses_ids.shape[0], 1)
+                local_padding_mask = response_idxs > local_sequence_lengths.unsqueeze(1)
 
-                # Mask ref_logprobs (policy logprobs masked later)
-                ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
+                # Mask ref_logprobs where padding occurs
+                local_ref_logprobs = torch.masked_fill(local_ref_logprobs, local_padding_mask, INVALID_LOGPROB)
 
-                # --- RLOO Advantage Calculation (Requires Policy Logprobs - calculated later) ---
-                # For now, calculate KL component of reward
-                # kl = logprobs - ref_logprobs # Cannot calculate yet
+                # Store data needed for optimization phase on CPU
+                # We need: query IDs, response IDs, reference logprob sums, scores, sequence lengths
+                all_query_ids_list_cpu.append(local_queries_repeated.cpu())
+                all_response_ids_list_cpu.append(local_processed_responses_ids.cpu())
+                all_ref_logprobs_sum_list_cpu.append(local_ref_logprobs.sum(1).cpu()) # Sum over sequence length
+                all_scores_list_cpu.append(local_scores.cpu())
+                all_sequence_lengths_list_cpu.append(local_sequence_lengths.cpu())
 
-                # Normalize raw scores if needed
-                if args.normalize_reward:
-                    # Gather scores across all processes within the accumulation step
-                    gathered_scores = accelerator.gather(scores)
-                    # Exclude padding/dummy scores if any? Assume all scores are valid here.
-                    mean_score = gathered_scores.mean()
-                    std_score = gathered_scores.std()
-                    scores = (scores - mean_score) / (std_score + 1e-8)
-                    scores = torch.clamp(scores, -args.reward_clip_range, args.reward_clip_range)
+                # --- Micro-step cleanup ---
+                del (raw_batch, local_prompts_ids, local_prompts_text, local_targets,
+                     local_generated_responses_text, responses_tokenized, local_responses_ids,
+                     local_processed_responses_ids, local_queries_repeated, local_query_responses_ids,
+                     local_query_mask, local_resp_attn_mask, local_query_responses_mask,
+                     local_ref_logprobs, local_processed_responses_text, local_scores,
+                     local_sequence_lengths, local_padding_mask, contain_eos_token)
+                if 'k_scores_list' in locals(): del k_scores_list
+                if 'k_scores_float' in locals(): del k_scores_float
+                # Empty cache periodically if accumulating many steps
+                if micro_step % 4 == 0: # Adjust frequency as needed
+                     torch.cuda.empty_cache()
+                     gc.collect()
+                accelerator.print(f"    Micro-step {micro_step+1}/{args.gradient_accumulation_steps} completed in {time.time() - micro_step_start_time:.2f}s")
 
-                # Store data needed for optimization phase
-                # We need queries_repeated, processed_responses_ids, ref_logprobs, scores, padding_mask
-                all_query_ids_list.append(queries_repeated.cpu())
-                all_response_ids_list.append(processed_responses_ids.cpu())
-                # Store ref_logprobs sum and scores for advantage calculation later
-                all_ref_logprobs_list.append(ref_logprobs.sum(1).cpu())
-                all_scores_list.append(scores.cpu())
-                # Store sequence lengths / padding mask info if needed, or recompute
-                all_sequence_lengths_list.append(sequence_lengths.cpu())
-
-                # --- End of Experience Generation (within gradient accumulation loop) ---
-                del (prompts_data, queries_repeated, responses_ids, processed_responses_ids,
-                     query_responses_ids, query_responses_mask, ref_logprobs, scores, padding_mask,
-                     sequence_lengths)
-                if 'k_scores' in locals(): del k_scores
-                if 'ref_logits' in locals(): del ref_logits
-                torch.cuda.empty_cache()
-                gc.collect()
 
             # --- End of Gradient Accumulation Loop ---
+            accumulation_end_time = time.time()
+            accelerator.print(f"  Gradient accumulation phase completed in {accumulation_end_time - step_start_time:.2f}s")
 
             # --- Optimization Phase ---
-            if not all_scores_list: continue # Skip if no data
+            if not all_scores_list_cpu:
+                 accelerator.print("Warning: No data accumulated, skipping optimization step.")
+                 continue # Skip if no data (e.g., first step failed)
 
             # Collate accumulated data from CPU lists to device tensors
-            batch_query_ids = torch.cat(all_query_ids_list, dim=0).to(device)
-            batch_response_ids = torch.cat(all_response_ids_list, dim=0).to(device)
-            batch_ref_logprobs_sum = torch.cat(all_ref_logprobs_list, dim=0).to(device)
-            batch_scores = torch.cat(all_scores_list, dim=0).to(device)
-            batch_seq_lengths = torch.cat(all_sequence_lengths_list, dim=0).to(device)
-            local_accumulation_batch_size = len(batch_scores) # Total samples (prompts*k*accum) on this device
+            # This batch contains data from all accumulation steps for the current device
+            batch_query_ids = torch.cat(all_query_ids_list_cpu, dim=0).to(device)
+            batch_response_ids = torch.cat(all_response_ids_list_cpu, dim=0).to(device)
+            batch_ref_logprobs_sum = torch.cat(all_ref_logprobs_sum_list_cpu, dim=0).to(device)
+            batch_scores = torch.cat(all_scores_list_cpu, dim=0).to(device)
+            batch_seq_lengths = torch.cat(all_sequence_lengths_list_cpu, dim=0).to(device)
+            local_total_samples_in_batch = len(batch_scores) # Should be local_bs * k * accum_steps
 
-            # RLOO updates once per batch of experience
-            for ppo_epoch_idx in range(args.num_ppo_epochs):
-                b_inds = torch.randperm(local_accumulation_batch_size, device=device)
-                # Minibatch size = #prompts * k * world_size? No, use local size.
-                # local_batch_size_per_step was #prompts * accum.
-                # Let's define minibatch size based on samples
-                local_samples_per_step = args.local_dataloader_batch_size * args.rloo_k * args.gradient_accumulation_steps
-                # Use a fraction of this for minibatch? Or just one big batch? RLOO often uses one batch.
-                # Let's stick to one batch for simplicity, matching original RLOO structure.
-                # If memory is an issue, minibatching can be added here.
+            # Clear CPU lists
+            del (all_query_ids_list_cpu, all_response_ids_list_cpu, all_ref_logprobs_sum_list_cpu,
+                 all_scores_list_cpu, all_sequence_lengths_list_cpu)
+            gc.collect()
 
-                mini_batch_inds = b_inds # Use all indices
+            # RLOO updates typically happen once per batch of experience (no inner PPO epochs)
+            # Prepare data for the single optimization pass
+            mb_query_ids = batch_query_ids
+            mb_response_ids = batch_response_ids
+            mb_ref_logprobs_sum = batch_ref_logprobs_sum
+            mb_scores = batch_scores
+            mb_seq_lengths = batch_seq_lengths
 
-                # Get minibatch data (which is the whole accumulated batch)
-                mb_query_ids = batch_query_ids[mini_batch_inds]
-                mb_response_ids = batch_response_ids[mini_batch_inds]
-                mb_ref_logprobs_sum = batch_ref_logprobs_sum[mini_batch_inds]
-                mb_scores = batch_scores[mini_batch_inds]
-                mb_seq_lengths = batch_seq_lengths[mini_batch_inds]
-
-                # Recompute policy logprobs with gradients enabled
+            # Recompute policy logprobs with gradients enabled within the accelerator context
+            with accelerator.accumulate(self.model):
+                optim_start_time = time.time()
+                # Construct inputs for the policy forward pass
                 mb_query_responses_ids = torch.cat([mb_query_ids, mb_response_ids], dim=1)
-                mb_query_mask = torch.ones_like(mb_query_ids)
-                mb_resp_padding_mask = (mb_response_ids == self.processing_class.pad_token_id)
-                mb_resp_attn_mask = ~mb_resp_padding_mask
+                mb_query_mask = torch.ones_like(mb_query_ids, device=device)
+                # Recompute response attention mask based on sequence lengths
+                mb_response_idxs = torch.arange(mb_response_ids.shape[1], device=device).repeat(mb_response_ids.shape[0], 1)
+                mb_resp_attn_mask = (mb_response_idxs <= mb_seq_lengths.unsqueeze(1)).long() # <= because seq_length is 0-indexed length
                 mb_query_responses_mask = torch.cat([mb_query_mask, mb_resp_attn_mask], dim=1)
                 mb_context_length = mb_query_ids.shape[1]
 
-                # Use accelerator.accumulate context for gradient handling
-                with accelerator.accumulate(self.model):
-                    # Forward pass for policy logprobs
-                    output = forward(self.model, mb_query_responses_ids, mb_query_responses_mask)
-                    logits = output.logits[:, mb_context_length - 1 : -1]
-                    logits /= args.temperature + 1e-7
+                # Forward pass for policy logprobs
+                output = forward(self.model, mb_query_responses_ids, mb_query_responses_mask)
+                logits = output.logits[:, mb_context_length - 1 : -1] # Logits for response tokens
+                logits /= args.temperature + 1e-7 # Apply temperature
 
-                    # Compute new logprobs (token level)
-                    new_logprobs_token = selective_log_softmax(logits, mb_response_ids)
+                # Compute new logprobs (token level)
+                new_logprobs_token = selective_log_softmax(logits, mb_response_ids)
 
-                    # Apply padding mask (recompute or use stored seq lengths)
-                    mb_padding_mask = torch.arange(mb_response_ids.shape[1], device=device).repeat(mb_response_ids.shape[0], 1) > mb_seq_lengths.unsqueeze(1)
-                    new_logprobs_token = torch.masked_fill(new_logprobs_token, mb_padding_mask, INVALID_LOGPROB)
-                    new_logprobs_sum = new_logprobs_token.sum(1) # Sum logprobs for sequence
+                # Apply padding mask (recompute based on seq lengths)
+                mb_padding_mask = mb_response_idxs > mb_seq_lengths.unsqueeze(1)
+                new_logprobs_token = torch.masked_fill(new_logprobs_token, mb_padding_mask, INVALID_LOGPROB)
+                # Sum logprobs for the sequence (ignoring padded parts)
+                # Use masked_fill with 0 before summing, or sum where mask is False
+                new_logprobs_sum = torch.where(~mb_padding_mask, new_logprobs_token, torch.tensor(0.0, device=device)).sum(1)
 
-                    # --- Compute Advantages (now that we have policy logprobs) ---
-                    kl = new_logprobs_sum - mb_ref_logprobs_sum # KL per sequence
+                # --- Compute Advantages ---
+                # KL divergence per sequence: KL = policy_logprob_sum - ref_logprob_sum
+                kl_sum = new_logprobs_sum - mb_ref_logprobs_sum # Shape: (local_total_samples_in_batch,)
 
-                    # Combine score and KL penalty
-                    if args.token_level_kl:
-                        # This requires token-level KL, which is complex to integrate here.
-                        # Let's stick to sequence-level KL penalty added to reward.
-                        warnings.warn("token_level_kl=True is not fully supported with API generation, using sequence-level KL penalty.")
-                        non_score_reward_per_step = -args.kl_coef * kl
-                        rlhf_reward = non_score_reward_per_step + mb_scores
+                # Normalize raw scores if needed (across the accumulated batch on this device)
+                # Note: Normalizing here might differ slightly from normalizing across global batch if done earlier
+                if args.normalize_reward:
+                    # Gather scores across all processes for this accumulation batch
+                    gathered_scores = accelerator.gather(mb_scores)
+                    if gathered_scores.numel() > 1:
+                         mean_score = gathered_scores.mean()
+                         std_score = gathered_scores.std()
+                         # Apply normalization to local scores
+                         mb_scores = (mb_scores - mean_score) / (std_score + 1e-8)
+                         mb_scores = torch.clamp(mb_scores, -args.reward_clip_range, args.reward_clip_range)
                     else:
-                        # Sequence-level KL
-                        non_score_reward_per_step = -args.kl_coef * kl
-                        rlhf_reward = non_score_reward_per_step + mb_scores
+                         warnings.warn("Could not normalize rewards: Not enough valid values gathered.")
 
-                    # Calculate RLOO baseline and advantages
-                    # Reshape rewards based on local batch size and k
-                    # local_accumulation_batch_size = local_bs * k * accum_steps
-                    num_prompts_in_batch = local_accumulation_batch_size // args.rloo_k
-                    rlhf_reward_grouped = rlhf_reward.reshape(args.rloo_k, num_prompts_in_batch)
-                    baseline = (rlhf_reward_grouped.sum(0, keepdim=True) - rlhf_reward_grouped) / (args.rloo_k - 1)
-                    advantages = rlhf_reward_grouped - baseline
-                    advantages = advantages.flatten() # Back to (local_bs * k * accum_steps)
+                # Combine score and KL penalty to get RLHF reward
+                # Using sequence-level KL penalty added to reward
+                non_score_reward_per_seq = -args.kl_coef * kl_sum
+                rlhf_reward = non_score_reward_per_seq + mb_scores # Shape: (local_total_samples_in_batch,)
 
-                    # Normalize advantages if needed (gather across all processes for mean/std)
-                    if args.normalize_advantage:
-                         gathered_advantages = accelerator.gather(advantages)
-                         # Filter NaNs/Infs just in case
-                         gathered_advantages = gathered_advantages[~torch.isnan(gathered_advantages) & ~torch.isinf(gathered_advantages)]
-                         if gathered_advantages.numel() > 1:
-                             mean_adv = gathered_advantages.mean()
-                             std_adv = gathered_advantages.std()
-                             advantages = (advantages - mean_adv) / (std_adv + 1e-8)
-                         else:
-                             warnings.warn("Could not normalize advantages: Not enough valid values.")
+                # Calculate RLOO baseline and advantages
+                # Reshape rewards based on how data was accumulated (num_prompts * k)
+                num_prompts_in_local_batch = local_total_samples_in_batch // args.rloo_k
+                if local_total_samples_in_batch % args.rloo_k != 0:
+                     raise ValueError("Total samples in batch is not divisible by rloo_k.")
+
+                # Reshape: (local_total_samples,) -> (k, num_prompts_local)
+                # Need to ensure the order matches: [p0_s0, p0_s1.. p0_sk, p1_s0, p1_s1..]
+                try:
+                    # This assumes the concatenated lists maintained the [p0_s0, p0_s1,...] order within each micro-batch
+                    rlhf_reward_grouped = rlhf_reward.reshape(num_prompts_in_local_batch, args.rloo_k).transpose(0, 1)
+                    # Shape check: (k, num_prompts_local)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to reshape rlhf_reward. Shape: {rlhf_reward.shape}, k: {args.rloo_k}, num_prompts: {num_prompts_in_local_batch}. Error: {e}")
 
 
-                    # --- RLOO Loss Calculation ---
-                    # Loss is - E[Adv * log P(response | prompt)]
-                    # We use the sum of logprobs for the sequence.
-                    pg_loss = -advantages * new_logprobs_sum # Use the recomputed logprobs
-                    pg_loss = pg_loss.mean()
+                # Calculate baseline: mean reward of other k-1 samples for the same prompt
+                # Sum across k dim, subtract self, divide by k-1
+                baseline = (rlhf_reward_grouped.sum(0, keepdim=True) - rlhf_reward_grouped) / (args.rloo_k - 1)
+                # Calculate advantages
+                advantages_grouped = rlhf_reward_grouped - baseline # Shape: (k, num_prompts_local)
+                # Flatten advantages back to match the order of samples
+                advantages = advantages_grouped.transpose(0, 1).flatten() # Shape: (local_total_samples_in_batch,)
 
-                    loss = pg_loss # Total loss (KL was included in reward)
+                # Normalize advantages if needed (gather across all processes for mean/std)
+                if args.normalize_advantage:
+                     gathered_advantages = accelerator.gather(advantages)
+                     # Filter NaNs/Infs just in case
+                     valid_advantages = gathered_advantages[~torch.isnan(gathered_advantages) & ~torch.isinf(gathered_advantages)]
+                     if valid_advantages.numel() > 1:
+                         mean_adv = valid_advantages.mean()
+                         std_adv = valid_advantages.std()
+                         advantages = (advantages - mean_adv) / (std_adv + 1e-8)
+                     elif valid_advantages.numel() > 0:
+                         # If std is zero or only one valid value, just center
+                         mean_adv = valid_advantages.mean()
+                         advantages = advantages - mean_adv
+                         if valid_advantages.numel() == 1:
+                            warnings.warn("Only one valid advantage value found after gathering. Centering advantages but not scaling.")
+                         else: # std is zero
+                            warnings.warn("Standard deviation of advantages is zero after gathering. Centering advantages but not scaling.")
+                     else:
+                         warnings.warn("Could not normalize advantages: No valid values found after gathering.")
 
-                    # Backward pass (managed by accelerator.accumulate)
-                    accelerator.backward(loss)
+                # --- RLOO Loss Calculation ---
+                # Loss is - E[Adv * log P(response | prompt)]
+                # We use the sum of logprobs for the sequence.
+                pg_loss = -advantages * new_logprobs_sum # Use the recomputed policy logprobs sum
+                pg_loss = pg_loss.mean() # Average over the local batch
 
-                    # --- Log Stats (inside accumulation context) ---
-                    with torch.no_grad():
-                         # Approx KL between old and new policy (using detached old logprobs requires storing them)
-                         # Let's skip approx KL for now, focus on KL vs ref
-                         policy_loss = pg_loss.item()
-                         # Entropy calculation
-                         prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                         masked_entropy = entropy.masked_fill(mb_padding_mask, 0.0)
-                         mean_entropy = (masked_entropy.sum() / (~mb_padding_mask).sum()).item()
+                loss = pg_loss # Total loss (KL was included in reward)
 
-                         # Store stats from this minibatch/accumulation step
-                         pg_loss_stats_accum.append(policy_loss)
-                         entropy_stats_accum.append(mean_entropy)
-                         # Store metrics calculated before advantage normalization
-                         all_kl_list.append(kl.cpu()) # Store sequence KL (policy vs ref)
-                         all_rlhf_rewards_list.append(rlhf_reward.cpu())
-                         all_non_score_rewards_list.append(non_score_reward_per_step.cpu())
-                         all_advantages_list.append(advantages.cpu()) # Store potentially normalized advantages
+                # Backward pass (managed by accelerator.accumulate)
+                accelerator.backward(loss)
+                optim_end_time = time.time()
+                accelerator.print(f"    Optimization forward/backward pass completed in {optim_end_time - optim_start_time:.2f}s")
 
 
-                    # End accumulate context
+                # --- Log Stats (inside accumulation context, before optimizer step) ---
+                # Store stats from this optimization step (which covers the accumulated batch)
+                # These will be gathered and reduced *after* the optimizer step if gradients were synced
+                with torch.no_grad():
+                     policy_loss_item = pg_loss.item()
+                     # Entropy calculation
+                     prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                     # Mask entropy for padding and average over non-padded tokens
+                     masked_entropy = entropy.masked_fill(mb_padding_mask, 0.0)
+                     # Sum entropy over sequence and average over batch, or average over all valid tokens?
+                     # Let's average over valid tokens:
+                     mean_entropy_item = (masked_entropy.sum() / (~mb_padding_mask).sum()).item()
 
-                # --- End Minibatch Loop (only one minibatch here) ---
-            # --- End PPO Epoch Loop (only one epoch here) ---
+                     # Store metrics calculated *before* potential advantage normalization for logging clarity
+                     kl_sum_detached = kl_sum.detach().cpu()
+                     rlhf_reward_detached = rlhf_reward.detach().cpu()
+                     non_score_reward_detached = non_score_reward_per_seq.detach().cpu()
+                     # Store advantages *after* potential normalization
+                     advantages_detached = advantages.detach().cpu()
+                     scores_detached = mb_scores.detach().cpu() # Scores potentially normalized if normalize_reward=True
+
+            # --- End Accumulate Context ---
 
             # --- Optimizer Step, LR Scheduling, Logging ---
             if accelerator.sync_gradients:
+                optimizer_step_start_time = time.time()
                 # Clip gradients if needed
                 if args.max_grad_norm is not None:
                     accelerator.clip_grad_norm_(self.model.parameters(), args.max_grad_norm)
@@ -853,74 +918,100 @@ class RLOOIndirectTrainer(Trainer):
                 self.optimizer.zero_grad() # Zero gradients *after* optimizer step
 
                 self.lr_scheduler.step()
-                self.state.global_step += 1
+                self.state.global_step += 1 # Increment global step only when optimizer steps
 
-                # Gather accumulated stats across all GPUs for logging
+                accelerator.print(f"    Optimizer step completed in {time.time() - optimizer_step_start_time:.2f}s")
+
+                # --- Gather and Log Metrics ---
+                # Gather stats computed *during* the optimization phase across all GPUs for logging
+                # Perform reduction only on the main process after gathering
                 if accelerator.is_main_process:
-                     # Collate metrics calculated during optimization
-                     log_scores = torch.cat(all_scores_list, dim=0).float() # From generation phase
-                     log_advantages = torch.cat(all_advantages_list, dim=0).float() # From optimization phase
-                     log_rlhf_rewards = torch.cat(all_rlhf_rewards_list, dim=0).float()
-                     log_non_score_rewards = torch.cat(all_non_score_rewards_list, dim=0).float()
-                     log_kl_sum = torch.cat(all_kl_list, dim=0).float() # KL(policy || ref)
-                     log_seq_lengths = torch.cat(all_sequence_lengths_list, dim=0) # From generation phase
+                     # Gather stats from all processes. Use gather_object for lists/tensors stored on CPU.
+                     # Note: gather() works on tensors currently on GPU.
+                     gathered_kl_sum = accelerator.gather(kl_sum_detached.to(device)).float()
+                     gathered_rlhf_reward = accelerator.gather(rlhf_reward_detached.to(device)).float()
+                     gathered_non_score_reward = accelerator.gather(non_score_reward_detached.to(device)).float()
+                     gathered_advantages = accelerator.gather(advantages_detached.to(device)).float()
+                     gathered_scores = accelerator.gather(scores_detached.to(device)).float()
+                     gathered_seq_lengths = accelerator.gather(batch_seq_lengths.to(device)) # Already on device from batch_*
 
-                     # Aggregate stats from optimization phase loop (only one entry if no minibatching)
-                     mean_pg_loss = torch.tensor(np.mean(pg_loss_stats_accum), device=device) if pg_loss_stats_accum else torch.tensor(0.0, device=device)
-                     mean_entropy = torch.tensor(np.mean(entropy_stats_accum), device=device) if entropy_stats_accum else torch.tensor(0.0, device=device)
+                     # Reduce metrics that were calculated per-device during optimization
+                     # Convert single items to tensors for reduction
+                     policy_loss_tensor = torch.tensor(policy_loss_item, device=device)
+                     mean_entropy_tensor = torch.tensor(mean_entropy_item, device=device)
 
-                     # Reduce metrics across processes
-                     mean_score_red = reduce(log_scores.mean(), reduction='mean')
-                     mean_adv_red = reduce(log_advantages.mean(), reduction='mean')
-                     std_adv_red = reduce(log_advantages.std(), reduction='mean')
-                     mean_rlhf_reward_red = reduce(log_rlhf_rewards.mean(), reduction='mean')
-                     mean_non_score_reward_red = reduce(log_non_score_rewards.mean(), reduction='mean')
-                     mean_kl_red = reduce(log_kl_sum.mean(), reduction='mean')
-                     mean_seq_len_red = reduce(log_seq_lengths.float().mean(), reduction='mean')
-                     mean_pg_loss_red = reduce(mean_pg_loss, reduction='mean')
-                     mean_entropy_red = reduce(mean_entropy, reduction='mean')
+                     mean_pg_loss_red = reduce(policy_loss_tensor, reduction='mean').item()
+                     mean_entropy_red = reduce(mean_entropy_tensor, reduction='mean').item()
+
+                     # Calculate means/stds from gathered tensors
+                     mean_score_red = gathered_scores.mean().item()
+                     mean_adv_red = gathered_advantages.mean().item()
+                     std_adv_red = gathered_advantages.std().item()
+                     mean_rlhf_reward_red = gathered_rlhf_reward.mean().item()
+                     mean_non_score_reward_red = gathered_non_score_reward.mean().item()
+                     mean_kl_red = gathered_kl_sum.mean().item() # Mean KL per sequence
+                     mean_seq_len_red = gathered_seq_lengths.float().mean().item()
+
 
                      metrics = {}
-                     metrics["train/episode"] = self.state.global_step * args.total_batch_size_per_update # Log based on prompts processed
-                     metrics["train/reward_score"] = mean_score_red.item()
-                     metrics["train/reward_rlhf"] = mean_rlhf_reward_red.item()
-                     metrics["train/reward_non_score"] = mean_non_score_reward_red.item() # Should be ~ -kl_coef * kl_ref_policy
-                     metrics["train/advantage_mean"] = mean_adv_red.item()
-                     metrics["train/advantage_std"] = std_adv_red.item()
-                     metrics["train/kl_ref_policy"] = mean_kl_red.item() # KL vs reference policy
-                     metrics["train/policy_entropy"] = mean_entropy_red.item()
-                     metrics["train/loss_policy"] = mean_pg_loss_red.item()
-                     # metrics["train/kl_approx"] = mean_approxkl_red.item() # Not calculated
-                     # metrics["train/ratio"] = mean_ratio_red.item() # Not calculated
-                     metrics["train/seq_length"] = mean_seq_len_red.item()
+                     # Log based on optimizer steps (global_step)
+                     metrics["train/episode"] = self.state.global_step * args.total_prompts_per_update # Log based on prompts processed per update
+                     metrics["train/reward_score"] = mean_score_red
+                     metrics["train/reward_rlhf"] = mean_rlhf_reward_red
+                     metrics["train/reward_non_score"] = mean_non_score_reward_red # Should be ~ -kl_coef * kl_ref_policy
+                     metrics["train/advantage_mean"] = mean_adv_red
+                     metrics["train/advantage_std"] = std_adv_red
+                     metrics["train/kl_ref_policy"] = mean_kl_red # KL(policy || ref) per sequence
+                     metrics["train/policy_entropy"] = mean_entropy_red
+                     metrics["train/loss_policy"] = mean_pg_loss_red
+                     metrics["train/seq_length"] = mean_seq_len_red
                      metrics["train/lr"] = self.lr_scheduler.get_last_lr()[0]
-                     metrics["train/epoch"] = self.state.epoch + micro_step / args.gradient_accumulation_steps / num_update_steps_per_epoch # More precise epoch
+                     # Calculate epoch based on global steps and steps per epoch
+                     current_epoch = self.state.global_step / num_update_steps_per_epoch if num_update_steps_per_epoch > 0 else 0
+                     metrics["train/epoch"] = current_epoch
 
-                     self.log(metrics)
+                     self.log(metrics) # Log the aggregated metrics
 
-            # --- Callback Handling, Checkpointing, Evaluation, Sample Generation ---
-            self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                # Trigger callbacks, checkpointing, evaluation checks based on global_step
+                self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-            if self.control.should_save:
-                 self._save_checkpoint() # Saves adapter to checkpoint dir
-                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                if self.control.should_save:
+                     self._save_checkpoint() # Saves adapter to checkpoint dir based on global_step
+                     self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
-            if self.control.should_evaluate:
-                 # Evaluation needs adapting for API generation too
-                 # metrics = self.evaluate()
-                 # self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
-                 accelerator.print("Evaluation not yet implemented for API generation.")
-                 pass
+                if self.control.should_evaluate:
+                     # Evaluation needs adapting for API generation too
+                     accelerator.print("Triggering evaluation...")
+                     # Ensure model is in eval mode for evaluation
+                     self.model.eval()
+                     metrics = self.evaluate() # Call evaluate method
+                     # Ensure model is back in train mode after evaluation
+                     self.model.train()
+                     self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
 
-            if accelerator.is_main_process and args.num_sample_generations > 0 and self.state.global_step > 0 and \
-               (self.state.global_step % self.sample_generations_freq == 0 or self.control.should_training_stop):
-                 self.generate_completions(sampling=True) # Needs update for API
+
+                # Sample generation check (moved inside sync_gradients block)
+                if accelerator.is_main_process and args.num_sample_generations > 0 and self.state.global_step > 0 and \
+                   (self.state.global_step % self.sample_generations_freq == 0 or self.control.should_training_stop):
+                     accelerator.print("Generating samples for logging...")
+                     # Ensure model is in eval mode for generation
+                     self.model.eval()
+                     self.generate_completions(sampling=True) # Use API for generation
+                     # Ensure model is back in train mode
+                     self.model.train()
+
+
+            # --- End Sync Gradients Block ---
 
             if self.control.should_training_stop:
+                 accelerator.print("Training stopping signal received.")
                  break
 
-            # Update epoch state (based on prompts processed)
-            self.state.epoch += 1 / num_update_steps_per_epoch
+            # Update epoch state (handled by logging logic)
+            step_end_time = time.time()
+            accelerator.print(f"  Full step {step}/{max_steps} completed in {step_end_time - step_start_time:.2f}s (Global Step: {self.state.global_step})")
+            # Optional: Add a small sleep if GPU util is 100% and hitting issues
+            # time.sleep(0.1)
 
         # --- End of Training Loop ---
         accelerator.print("=== Finished Training ===")
@@ -930,6 +1021,8 @@ class RLOOIndirectTrainer(Trainer):
         if self.control.should_save:
             self._save_checkpoint()
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
+        accelerator.wait_for_everyone() # Ensure all processes finish cleanly
 
     def _save_checkpoint(self, trial=None, metrics=None):
          """Saves the PEFT adapter."""
