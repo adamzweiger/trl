@@ -28,7 +28,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, PartialState
-from accelerate.utils import broadcast_object_list, broadcast, gather_object, pad_across_processes, reduce
+from accelerate.utils import broadcast_object_list, broadcast, gather_object, pad_across_processes, reduce, FullyShardedDataParallelPlugin
+from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
+from peft.utils import get_peft_model_state_dict
+from peft import PeftModel # Ensure PeftModel is imported
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import (
@@ -105,7 +108,7 @@ class RLOOIndirectTrainer(Trainer):
         optimizers (`tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]`):
              Optional tuple of optimizer and scheduler. Defaults to AdamW and linear warmup.
     """
-    _tag_names = ["trl", "rloo-indirect", "peft", "vllm"]
+    _tag_names = ["trl", "rloo-indirect", "peft", "vllm", "fsdp"]
 
     def __init__(
         self,
@@ -270,23 +273,44 @@ class RLOOIndirectTrainer(Trainer):
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
 
+        self.is_fsdp_enabled = isinstance(self.accelerator.state.fsdp_plugin, FullyShardedDataParallelPlugin)
+        if self.is_fsdp_enabled:
+            print(f"[Rank {self.accelerator.process_index}] FSDP is enabled via Accelerate.")
+            # You can access fsdp_plugin settings if needed:
+            # print(f"[Rank {self.accelerator.process_index}] FSDP Plugin Config: {self.accelerator.state.fsdp_plugin}")
+        else:
+             print(f"[Rank {self.accelerator.process_index}] FSDP is NOT enabled via Accelerate.")
+        if self.is_fsdp_enabled:
+             print(f"[Rank {self.accelerator.process_index}] Model class after FSDP prepare: {type(self.model)}")
+
         # Add PEFT model tags
         if hasattr(self.model, "add_model_tags"):
-            self.model.add_model_tags(self._tag_names)
+            model_to_tag = self.model
+            if self.is_fsdp_enabled and hasattr(self.model, 'module'):
+                MAX_UNWRAP_DEPTH = 5
+                for _ in range(MAX_UNWRAP_DEPTH):
+                    if isinstance(model_to_tag, PeftModel): break
+                    if hasattr(model_to_tag, 'module'): model_to_tag = model_to_tag.module
+                    else: break
+            try:
+                if hasattr(model_to_tag, 'add_model_tags'):
+                     model_to_tag.add_model_tags(self._tag_names)
+                else:
+                     print(f"[Rank {accelerator.process_index}] Warning: Could not find add_model_tags method on model object {type(model_to_tag)}.")
+            except Exception as e:
+                 print(f"[Rank {accelerator.process_index}] Warning: Failed to add model tags: {e}")
 
         # Create output directory if needed
         if self.is_world_process_zero():
-            os.makedirs(args.output_dir, exist_ok=True)
-            # Ensure the specific adapter save path exists
-            os.makedirs(self.adapter_save_path, exist_ok=True)
-            # Save initial PEFT config
-            try:
-                # Need unwrapped model if using FSDP/DDP
-                unwrapped_model = self.accelerator.unwrap_model(self.model)
-                unwrapped_model.save_pretrained(args.output_dir)
-            except Exception as e:
-                 print(f"Warning: Could not save initial PEFT config: {e}")
-        
+             os.makedirs(args.output_dir, exist_ok=True)
+             os.makedirs(self.adapter_save_path, exist_ok=True)
+             print(f"[Rank 0] Ensured output directories exist: {args.output_dir}, {self.adapter_save_path}")
+
+        # Add a barrier here just to ensure directory creation is done before proceeding
+        # This is less likely to cause issues than saving.
+        self.accelerator.wait_for_everyone()
+
+
         print(f"[Process Index {self.args.process_index}] RLOOIndirectTrainer initialization finished.")
 
     def _validate_dataset_columns(self):
@@ -437,6 +461,26 @@ class RLOOIndirectTrainer(Trainer):
             num_workers=self.args.dataloader_num_workers,
         )
 
+    def find_peft_model(model_to_search):
+        MAX_UNWRAP_DEPTH = 5 # Adjust as needed
+        peft_model_instance = None
+        if isinstance(model_to_search, PeftModel):
+            return model_to_search
+        current_model = model_to_search
+        for _ in range(MAX_UNWRAP_DEPTH):
+            if isinstance(current_model, PeftModel):
+                peft_model_instance = current_model
+                break
+            if hasattr(current_model, 'module'): # Common wrapper attribute (FSDP, DDP, etc.)
+                current_model = current_model.module
+            elif hasattr(current_model, 'base_model') and isinstance(current_model.base_model, PeftModel):
+                # Specific check if base_model itself is the Peft layer (less common directly)
+                peft_model_instance = current_model.base_model
+                break
+            else:
+                break # Cannot unwrap further
+        return peft_model_instance
+
     def train(self):
         """Main training loop."""
         args = self.args
@@ -446,7 +490,7 @@ class RLOOIndirectTrainer(Trainer):
         # Ensure adapter save directory exists
         if accelerator.is_main_process:
             os.makedirs(os.path.dirname(self.adapter_save_path), exist_ok=True)
-        accelerator.wait_for_everyone()
+        # No wait_for_everyone needed here, makedirs is fast and idempotent.
 
         # Setup dataloader iterator
         dataloader = self.train_dataloader
@@ -517,23 +561,107 @@ class RLOOIndirectTrainer(Trainer):
                 local_targets = raw_batch['target']       # List of targets, len = local_bs
                 local_bs = len(local_prompts_text)
 
-                # --- vLLM Generation via API ---
-                # 1. Save current adapter state (main process)
-                if accelerator.is_main_process:
-                    unwrapped_model = accelerator.unwrap_model(self.model)
-                    unwrapped_model.save_pretrained(self.adapter_save_path)
-                accelerator.wait_for_everyone() # Ensure save completes before API call
 
-                # 2. Load adapter into vLLM server via API (main process)
+                # --- Save Adapter Before vLLM Call ---
+                accelerator.print(f"Rank {accelerator.process_index}, Step {step}, MicroStep {micro_step}: Entering adapter save block...")
+                try:
+                    # 1. Unwrap the model (on all ranks - this is generally lightweight)
+                    unwrapped_model = accelerator.unwrap_model(self.model, keep_torch_compile=False) # Adjust compile flag if needed
+
+                    peft_model_instance = None
+                    # Check if the unwrapped model is directly the PeftModel
+                    if isinstance(unwrapped_model, PeftModel):
+                        peft_model_instance = unwrapped_model
+                    # Add more robust search if necessary (like your existing logic)
+                    elif hasattr(unwrapped_model, 'module') and isinstance(unwrapped_model.module, PeftModel):
+                         peft_model_instance = unwrapped_model.module
+                    else:
+                        model_to_find = unwrapped_model
+                        MAX_UNWRAP_DEPTH = 5
+                        for _ in range(MAX_UNWRAP_DEPTH):
+                            if isinstance(model_to_find, PeftModel):
+                                peft_model_instance = model_to_find
+                                break
+                            if hasattr(model_to_find, 'module'):
+                                model_to_find = model_to_find.module
+                            else:
+                                break
+
+                    if peft_model_instance is None:
+                         # Ensure consistent error handling/logging across ranks
+                         accelerator.print(f"Rank {accelerator.process_index}: Error: Could not find PeftModel instance. Skipping save.")
+                         # Decide how to proceed. Raising an error might be best.
+                         # Use accelerator.set_trigger() or similar if you need coordinated failure.
+                         raise RuntimeError(f"Rank {accelerator.process_index}: Could not find PeftModel instance during saving.")
+                    else:
+                        # 2. Ensure the target directory exists (main process responsibility)
+                        if accelerator.is_main_process:
+                            os.makedirs(self.adapter_save_path, exist_ok=True)
+
+                        # 3. Barrier: Ensure directory is created before *any* rank proceeds
+                        # This prevents potential race conditions if non-main ranks somehow
+                        # interacted with the path earlier (though unlikely with save_pretrained)
+                        accelerator.wait_for_everyone()
+
+                        accelerator.print(f"Rank {accelerator.process_index}: Found PeftModel instance: {type(peft_model_instance)}. Calling save_pretrained for adapter '{LORA_ADAPTER_NAME}'...")
+
+                        # 4. Call save_pretrained on ALL ranks.
+                        #    - It triggers the necessary FSDP state_dict gathering internally across all ranks.
+                        #    - The 'is_main_process' argument ensures only Rank 0 performs the file write.
+                        peft_model_instance.save_pretrained(
+                            self.adapter_save_path,
+                            selected_adapters=[LORA_ADAPTER_NAME], # Use the instance variable
+                            safe_serialization=True,
+                            is_main_process=accelerator.is_main_process # CRITICAL argument
+                        )
+
+                        # Log completion (main process confirms write initiation)
+                        if accelerator.is_main_process:
+                            accelerator.print(f"Rank 0: Successfully completed save_pretrained call for adapter '{LORA_ADAPTER_NAME}' to {self.adapter_save_path}")
+                        else:
+                            accelerator.print(f"Rank {accelerator.process_index}: Participated in save_pretrained (state gathering).")
+
+                except Exception as e:
+                    accelerator.print(f"Rank {accelerator.process_index}: Error during adapter saving block: {e}")
+                    # Consider more robust error handling/propagation if needed
+                    raise e # Re-raise to stop training
+
+                # 5. Barrier: Crucial! Ensure all processes wait here *after* the save call.
+                # This guarantees the FSDP gather and the Rank 0 write are finished
+                # before any process moves on to the vLLM API call.
+                accelerator.print(f"Rank {accelerator.process_index}: Finished adapter save block logic, waiting at final barrier...")
+                accelerator.wait_for_everyone()
+                accelerator.print(f"Rank {accelerator.process_index}: Passed final adapter save barrier.")
+                # --- End of Saving Block ---
+
+
+                # --- vLLM Generation via API ---
+                accelerator.print(f"Rank {accelerator.process_index}: Proceeding to load adapter via API...")
+                # 2. Load adapter into vLLM server via API (main process only needs the path)
                 outer_lora_path = os.path.join(self.adapter_save_path, LORA_ADAPTER_NAME)
                 adapter_loaded = self._load_adapter_via_api(outer_lora_path, self.vllm_adapter_name)
-                adapter_loaded_tensor = torch.tensor(1 if adapter_loaded else 0, device=device)
-                if accelerator.num_processes > 1:
-                     broadcast(adapter_loaded_tensor, from_process=0)
-                if adapter_loaded_tensor.item() == 0:
-                    raise RuntimeError(f"Failed to load adapter '{self.vllm_adapter_name}' into vLLM server. Stopping training.")
-                # No need for wait_for_everyone here, broadcast synchronizes
 
+                # Broadcast success/failure status needs device placement
+                adapter_loaded_tensor = torch.tensor(1 if adapter_loaded else 0, device=accelerator.device) # Ensure tensor is on correct device
+
+                # Broadcast success/failure status from rank 0
+                if accelerator.num_processes > 1:
+                     # Use accelerator's broadcast_object_list for potentially simpler handling or stick to tensor broadcast
+                     # broadcast(adapter_loaded_tensor, from_process=0)
+                     # Alternative using broadcast_object_list (might need adjustment based on object type)
+                     status_list = [adapter_loaded] # Wrap boolean in a list for broadcast_object_list
+                     broadcast_object_list(status_list, from_process=0)
+                     adapter_loaded_on_rank = status_list[0] # Unpack result
+                else:
+                    adapter_loaded_on_rank = adapter_loaded
+
+                if not adapter_loaded_on_rank:
+                    # If loading failed on rank 0 (and broadcasted), raise error on all ranks
+                    raise RuntimeError(f"Failed to load adapter '{self.vllm_adapter_name}' into vLLM server (Rank 0 reported failure). Stopping training.")
+                else:
+                    accelerator.print(f"Rank {accelerator.process_index}: Confirmed adapter load successful.")
+
+                # No need for extra wait_for_everyone here, broadcast synchronizes the status check.
                 # 3. Prepare API request parameters
                 sampling_params_dict = {
                     "n": args.rloo_k,
@@ -557,7 +685,7 @@ class RLOOIndirectTrainer(Trainer):
                     # Flatten the gathered list of lists of prompts
                     flat_prompts_global = []
                     for sublist in all_prompts_text_gathered:
-                        flat_prompts_global.extend(sublist)
+                        flat_prompts_global.append(sublist)
 
                     print(f"Process {accelerator.process_index} flattened gathered prompts: {flat_prompts_global}")
 
@@ -614,7 +742,9 @@ class RLOOIndirectTrainer(Trainer):
                     ) # Shape: (local_bs * k, proc_resp_len)
 
                 # --- Log Prob Calculation (Requires Reference Model) ---
+                print(f"Process {accelerator.process_index} preparing for logprob calculation...")
                 # Repeat original local prompts k times for logprob calculation
+
                 local_queries_repeated = local_prompts_ids.repeat_interleave(args.rloo_k, dim=0) # Shape: (local_bs * k, prompt_len)
                 local_context_length = local_queries_repeated.shape[1]
 
@@ -622,26 +752,54 @@ class RLOOIndirectTrainer(Trainer):
                 local_query_responses_ids = torch.cat([local_queries_repeated, local_processed_responses_ids], dim=1)
                 # Create attention mask for the combined sequence
                 local_query_mask = torch.ones_like(local_queries_repeated, device=device) # Assume query part is never padded
-                # Mask needs to cover padding in the response part
                 local_resp_attn_mask = (local_processed_responses_ids != self.processing_class.pad_token_id).long()
                 local_query_responses_mask = torch.cat([local_query_mask, local_resp_attn_mask], dim=1)
 
                 # Calculate reference logprobs (adapter disabled) using torch.no_grad()
+                accelerator.print(f"Rank {accelerator.process_index}: Entering reference logprob calculation...")
                 with torch.no_grad():
-                     # Ensure the model is in eval mode for ref logprobs if it has dropout/batchnorm layers
-                     # self.model.eval() # Potentially needed if base model has dropout
-                     # Disable adapter context manager
-                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                         ref_outputs = forward(self.model, local_query_responses_ids, local_query_responses_mask)
-                         # Slice logits corresponding to the response tokens only
-                         ref_logits = ref_outputs.logits[:, local_context_length - 1 : -1]
-                         # Apply temperature scaling (consistent with generation/policy calculation)
-                         ref_logits /= args.temperature + 1e-7
-                         # Calculate log softmax for the actual response tokens
-                         local_ref_logprobs = selective_log_softmax(ref_logits, local_processed_responses_ids)
-                         del ref_outputs, ref_logits
-                         torch.cuda.empty_cache()
-                     # self.model.train() # Switch back to train mode if changed
+                    # Find the underlying PeftModel instance reliably
+                    model_to_find = self.model
+                    peft_model_instance = None
+                    MAX_UNWRAP_DEPTH = 5
+                    for _ in range(MAX_UNWRAP_DEPTH):
+                         if isinstance(model_to_find, PeftModel):
+                             peft_model_instance = model_to_find
+                             break
+                         if hasattr(model_to_find, 'module'):
+                             model_to_find = model_to_find.module
+                         else:
+                             break
+
+                    if peft_model_instance is None:
+                         raise RuntimeError(f"Rank {accelerator.process_index}: Could not find underlying PeftModel instance to disable adapter.")
+
+                    accelerator.print(f"Rank {accelerator.process_index}: Found PeftModel {type(peft_model_instance)}, attempting to disable adapter...")
+                    
+                    import ipdb; ipdb.set_trace()
+                    outputs = forward(self.model, local_query_responses_ids, local_query_responses_mask)
+                    # Apply disable_adapter context manager to the found PeftModel instance
+                    with peft_model_instance.disable_adapter():
+                        accelerator.print(f"Rank {accelerator.process_index}: Adapter disabled, running forward pass through FSDP model {type(self.model)}...")
+                        # Run forward pass through the original FSDP-wrapped model
+                        ref_outputs = forward(self.model, local_query_responses_ids, local_query_responses_mask)
+                        accelerator.print(f"Rank {accelerator.process_index}: Forward pass for ref_logprobs completed.")
+
+                        # --- Logit processing ---
+                        ref_logits = ref_outputs.logits[:, local_context_length - 1 : -1]
+                        ref_logits /= args.temperature + 1e-7
+                        local_ref_logprobs = selective_log_softmax(ref_logits, local_processed_responses_ids)
+
+                        del ref_outputs, ref_logits # Clean up memory
+                        # Consider gc.collect() if memory pressure is high, but often not needed
+                        # gc.collect()
+                        # torch.cuda.empty_cache() # Use sparingly, can slow things down
+
+                    accelerator.print(f"Rank {accelerator.process_index}: Adapter re-enabled after context.")
+
+                accelerator.print(f"Rank {accelerator.process_index}: Exiting reference logprob calculation.")
+                torch.cuda.empty_cache() # Maybe helpful after the no_grad block
+
 
                 # --- Reward Calculation (Local) ---
                 # Decode processed responses for the reward function
@@ -1025,19 +1183,44 @@ class RLOOIndirectTrainer(Trainer):
         accelerator.wait_for_everyone() # Ensure all processes finish cleanly
 
     def _save_checkpoint(self, trial=None, metrics=None):
-         """Saves the PEFT adapter."""
+         """Saves the PEFT adapter during training."""
+         # Use a barrier BEFORE saving to ensure all ranks are ready
+         self.accelerator.wait_for_everyone()
+
          if not self.is_world_process_zero():
              return
 
          save_path = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
          print(f"Saving adapter checkpoint to {save_path}")
-         # Ensure model is not wrapped by accelerator's utilities before saving PEFT model
-         unwrapped_model = self.accelerator.unwrap_model(self.model)
-         unwrapped_model.save_pretrained(save_path)
-         # Optionally save tokenizer
-         self.processing_class.save_pretrained(save_path)
-         # Optionally save trainer state
-         self.state.save_to_json(os.path.join(save_path, "trainer_state.json"))
+
+         try:
+             # Important: Use accelerator.unwrap_model() before saving with FSDP
+             unwrapped_model = self.accelerator.unwrap_model(self.model)
+
+             # Ensure we're saving the PeftModel if it was wrapped
+             model_to_save = unwrapped_model
+             MAX_UNWRAP_DEPTH = 5 # Safety limit
+             for _ in range(MAX_UNWRAP_DEPTH):
+                 if isinstance(model_to_save, PeftModel):
+                     break # Found the PeftModel
+                 # Check if FSDP is still wrapping the unwrapped model (can happen)
+                 if 'FullyShardedDataParallel' in str(type(model_to_save)) and hasattr(model_to_save, 'module'):
+                     model_to_save = model_to_save.module
+                 else:
+                     break # No more .module attribute or not FSDP
+
+             if isinstance(model_to_save, PeftModel):
+                 model_to_save.save_pretrained(save_path)
+                 self.processing_class.save_pretrained(save_path) # Save tokenizer too
+                 print(f"Successfully saved checkpoint: {save_path}")
+             else:
+                 print(f"Error in _save_checkpoint: Could not find underlying PeftModel to save. Found type: {type(model_to_save)}")
+
+             # Optionally save trainer state
+             self.state.save_to_json(os.path.join(save_path, "trainer_state.json"))
+
+         except Exception as e:
+             print(f"Error during _save_checkpoint: {e}")
 
 
     @torch.no_grad()

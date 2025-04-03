@@ -1,0 +1,25 @@
+# accelerate_configs/fsdp_qwen_config.yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP # Changed from DEEPSPEED
+downcast_bf16: 'no'
+fsdp_config:
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP # Common policy for transformers
+  fsdp_backward_prefetch: BACKWARD_PRE # Pre-fetches next layer's params during backward
+  fsdp_cpu_ram_efficient_loading: true # Can help with large models, keep it
+  fsdp_forward_prefetch: false # Usually disabled unless profiling shows benefit
+  fsdp_offload_params: false # Start with false (no CPU offload) for simplicity/performance
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: FULL_STATE_DICT # Important for saving/loading large models, PEFT might override needed parts
+  fsdp_sync_module_states: true # Sync buffers etc. at the beginning
+  fsdp_transformer_layer_cls_to_wrap: Qwen2DecoderLayer
+  fsdp_use_orig_params: true # Recommended true for PyTorch >= 2.1, helps with parameter access & PEFT
+machine_rank: 0
+main_training_function: main # Keep consistent if your script entry point is main
+mixed_precision: 'bf16'
+num_machines: 1
+num_processes: 2 # Should match --num_processes in accelerate launch
+rdzv_backend: static
+same_network: true
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
