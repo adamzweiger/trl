@@ -1,6 +1,6 @@
 # accelerate_configs/fsdp_qwen_config.yaml
 compute_environment: LOCAL_MACHINE
-distributed_type: FSDP # Changed from DEEPSPEED
+distributed_type: FSDP
 downcast_bf16: 'no'
 fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP # Common policy for transformers
@@ -13,6 +13,7 @@ fsdp_config:
   fsdp_sync_module_states: true # Sync buffers etc. at the beginning
   fsdp_transformer_layer_cls_to_wrap: Qwen2DecoderLayer
   fsdp_use_orig_params: true # Recommended true for PyTorch >= 2.1, helps with parameter access & PEFT
+  fsdp_activation_checkpointing: true # Very important to save memory
 machine_rank: 0
 main_training_function: main # Keep consistent if your script entry point is main
 mixed_precision: 'bf16'
