@@ -60,9 +60,6 @@ if is_rich_available():
     from rich.table import Table
     from rich.text import Text
 
-if is_comet_available():
-    import comet_ml
-
 if is_peft_available():
     from peft import LoraConfig, PeftConfig
 
@@ -1559,37 +1556,6 @@ def generate_model_card(
     return card
 
 
-def get_comet_experiment_url() -> Optional[str]:
-    """
-    If Comet integration is enabled, return the URL of the current Comet experiment; otherwise, return `None`.
-    """
-    if not is_comet_available():
-        return None
-
-    if comet_ml.get_running_experiment() is not None:
-        return comet_ml.get_running_experiment().url
-
-    return None
-
-
-def log_table_to_comet_experiment(name: str, table: pd.DataFrame) -> None:
-    """
-    If Comet integration is enabled logs a table to the Comet experiment if it is currently running.
-
-    Args:
-        name (`str`):
-            Table name.
-        table (`pd.DataFrame`):
-            The Pandas DataFrame containing the table to log.
-    """
-    if not is_comet_available():
-        raise ModuleNotFoundError("The comet-ml is not installed. Please install it first: pip install comet-ml")
-
-    experiment = comet_ml.get_running_experiment()
-    if experiment is not None:
-        experiment.log_table(tabular_data=table, filename=name)
-
-
 def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
     """
     Shift non-zero elements in the mask and corresponding tensors to the left.
@@ -1743,3 +1709,4 @@ def print_prompt_completions_sample(prompts: list[str], completions: list[str], 
 
     panel = Panel(table, expand=False, title=f"Step {step}", border_style="bold white")
     console.print(panel)
+
