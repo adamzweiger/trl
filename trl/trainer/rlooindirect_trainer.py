@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 from accelerate import Accelerator, PartialState
 from accelerate.utils import broadcast_object_list, broadcast, gather_object, pad_across_processes, reduce, FullyShardedDataParallelPlugin
-from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
+from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions, get_optimizer_state_dict, set_optimizer_state_dict
 from peft import PeftModel
 from datasets import Dataset
 from torch.utils.data import DataLoader
@@ -249,6 +249,21 @@ class RLOOIndirectTrainer(Trainer):
         self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler = self.accelerator.prepare(
             self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler
         )
+
+        # debug start
+        accelerator.print("--- Initial Optimizer State After Prepare ---")
+        accelerator.print(f"Optimizer Type: {type(self.optimizer)}")
+        # If wrapped by AcceleratedOptimizer, access the original via .optimizer
+        if hasattr(self.optimizer, 'optimizer'):
+            accelerator.print(f"Wrapped Optimizer Type: {type(self.optimizer.optimizer)}")
+            accelerator.print(f"Wrapped Optimizer Param Groups: {self.optimizer.optimizer.param_groups}")
+            accelerator.print(f"Wrapped Optimizer Defaults: {self.optimizer.optimizer.defaults}")
+        else:
+            accelerator.print(f"Optimizer Param Groups: {self.optimizer.param_groups}")
+            accelerator.print(f"Optimizer Defaults: {self.optimizer.defaults}")
+        accelerator.print("-" * 40)
+        # debug end
+
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
 
@@ -869,8 +884,7 @@ class RLOOIndirectTrainer(Trainer):
             accelerator.print(f"Rank {accelerator.process_index}: Starting reward calculation phase...")
             all_scores_list_cpu = [] # Initialize the list to store scores
 
-            # We need the sequence lengths and response IDs (on CPU) to calculate EOS penalty
-            # Concatenate them temporarily for easier indexing, or iterate through the lists
+            # Get IDs and lengths needed for potential EOS penalty calculation later
             temp_response_ids_full_cpu = torch.cat(all_response_ids_list_cpu, dim=0)
             temp_sequence_lengths_full_cpu = torch.cat(all_sequence_lengths_list_cpu, dim=0)
 
@@ -878,63 +892,214 @@ class RLOOIndirectTrainer(Trainer):
             num_micro_batches = len(all_response_ids_list_cpu) # Should equal gradient_accumulation_steps
             micro_batch_size = args.per_device_train_batch_size * args.rloo_k if num_micro_batches > 0 else 0
 
-            # Iterate based on the structure of the accumulated lists
-            current_text_idx = 0
-            for i in range(num_micro_batches):
-                # Calculate indices for this micro-batch within the flat lists
-                start_idx = i * micro_batch_size
-                end_idx = start_idx + micro_batch_size
-                
-                # Extract data for this micro-batch (mostly for indexing reference)
-                # We primarily need the text data and IDs/lengths for EOS penalty
-                local_response_ids_cpu = all_response_ids_list_cpu[i] # Shape: (local_bs*k, seq_len)
-                local_sequence_lengths_cpu = all_sequence_lengths_list_cpu[i] # Shape: (local_bs*k,)
-                
-                local_bs_micro = local_response_ids_cpu.shape[0] // args.rloo_k # Num prompts in this micro-batch
-                
-                local_scores_cpu = torch.zeros(local_bs_micro * args.rloo_k, dtype=torch.float) # Scores on CPU
+            # Store optimizer state on CPU before reward calculation if self-editing
+            main_optimizer_state_memory = None
+            if args.should_self_edit:
 
-                # Iterate through prompts within this micro-batch
-                current_score_idx = 0
-                for prompt_idx in range(local_bs_micro):
-                    # Extract the corresponding texts for this prompt and its k completions
-                    prompt_text = all_prompts_text_list_cpu[current_text_idx // args.rloo_k]
-                    target = all_targets_list_cpu[current_text_idx // args.rloo_k]
-                    k_completions = all_processed_responses_text_list_cpu[current_text_idx : current_text_idx + args.rloo_k]
+                # debug start
+                accelerator.print(f"--- Optimizer State Before get_optimizer_state_dict (Step {step+1}) ---")
+                accelerator.print(f"Optimizer Type: {type(self.optimizer)}")
+                if hasattr(self.optimizer, 'optimizer'): # Check if wrapped
+                     accelerator.print(f"Wrapped Optimizer Param Groups: {self.optimizer.optimizer.param_groups}")
+                else:
+                     accelerator.print(f"Optimizer Param Groups: {self.optimizer.param_groups}")
+                accelerator.print("-" * 60)
+                # debug end
 
+                accelerator.print(f"Rank {accelerator.process_index}: Retrieving main optimizer state for self-edit reward calculation.")
+
+                accelerator.print(f"Rank {accelerator.process_index}: Offloading main optimizer state to CPU for self-edit reward calculation.")
+                try:
+                    # Options to retrieve state, offloading to CPU is generally safer for large states
+                    options = StateDictOptions(cpu_offload=True)
+                    main_optimizer_state_memory = get_optimizer_state_dict(
+                        model=self.model, # Pass the Accelerator-prepared model
+                        optimizers=self.optimizer,
+                        options=options
+                    )
+
+                    # ---> START DEBUG PRINT <---
+                    accelerator.print(f"--- Retrieved Optimizer State Dict (Step {step+1}) ---")
+                    if main_optimizer_state_memory is not None:
+                         accelerator.print(f"State Dict Keys: {main_optimizer_state_memory.keys()}")
+                         # Print param_groups from the state dict
+                         if 'param_groups' in main_optimizer_state_memory:
+                             accelerator.print("State Dict 'param_groups':")
+                             for i, group in enumerate(main_optimizer_state_memory['param_groups']):
+                                 # Don't print 'params' list itself, it's huge (just len)
+                                 group_repr = {k: v for k, v in group.items() if k != 'params'}
+                                 group_repr['num_params'] = len(group.get('params', []))
+                                 accelerator.print(f"  Group {i}: {group_repr}")
+                         else:
+                              accelerator.print("State Dict does NOT contain 'param_groups' key.")
+
+                         # Optionally print state keys/shapes (can be very verbose!)
+                         # if 'state' in main_optimizer_state_memory:
+                         #     accelerator.print("State Dict 'state' keys:")
+                         #     for param_id, state_val in main_optimizer_state_memory['state'].items():
+                         #         accelerator.print(f"  Param ID {param_id}: { {k: v.shape if isinstance(v, torch.Tensor) else type(v) for k,v in state_val.items()} }")
+                         # else:
+                         #      accelerator.print("State Dict does NOT contain 'state' key.")
+                    else:
+                         accelerator.print("Retrieved State Dict is None")
+                    accelerator.print("-" * 60)
+                    # ---> END DEBUG PRINT <---
+
+                    accelerator.print(f"Rank {accelerator.process_index}: Optimizer state retrieved (potentially offloaded to CPU).")
+                    # Clear potential GPU memory refs before no_grad
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                     accelerator.print(f"CRITICAL ERROR: Failed to get optimizer state: {e}. Aborting.")
+                     raise e
+
+            # Use no_grad as the reward calculation itself should not compute gradients
+            with torch.no_grad():
+                if args.should_self_edit:
+                    accelerator.print(f"Rank {accelerator.process_index}: Calling _calculate_self_edit_rewards...")
+                    # Note: The current dummy _calculate_self_edit_rewards doesn't use self.model.
+                    # Future implementations needing the model would handle adapter states internally.
                     try:
-                        reward_kwargs = self.reward_fn_kwargs.copy()
-                        reward_kwargs['target'] = target
-                        k_scores_list = self.reward_fn(
-                            prompt_text=prompt_text, completions_text=k_completions, **reward_kwargs
+                        # Pass all accumulated text data at once
+                        flat_scores_list = self._calculate_self_edit_rewards(
+                            prompt_texts=all_prompts_text_list_cpu,
+                            completions_texts=all_processed_responses_text_list_cpu,
+                            targets=all_targets_list_cpu,
+                            **self.reward_fn_kwargs # Pass kwargs if needed by self-edit func
                         )
+                        # Ensure scores are on CPU
+                        scores_tensor_cpu = torch.tensor(flat_scores_list, dtype=torch.float, device='cpu')
+
+                        # Apply EOS Penalty to the entire batch of scores
+                        contain_eos_token = torch.any(
+                            (temp_response_ids_full_cpu == self.processing_class.eos_token_id) &
+                            (torch.arange(temp_response_ids_full_cpu.shape[1]) <= temp_sequence_lengths_full_cpu.unsqueeze(1)),
+                            dim=1
+                        )
+                        if args.missing_eos_penalty is not None:
+                            # Ensure indices align if scores_tensor_cpu is shorter (should not happen with checks)
+                            if len(scores_tensor_cpu) == len(contain_eos_token):
+                                scores_tensor_cpu[~contain_eos_token] -= args.missing_eos_penalty
+                            else:
+                                accelerator.print(f"Warning: Score tensor length ({len(scores_tensor_cpu)}) mismatch with EOS mask length ({len(contain_eos_token)}). Skipping EOS penalty.")
+
+                        # Reshape scores back into list compatible with micro-batch structure for consistency downstream
+                        current_idx = 0
+                        for i in range(num_micro_batches):
+                            end_idx = current_idx + micro_batch_size
+                            # Handle potential last batch smaller size if drop_last=False (though currently True)
+                            actual_end_idx = min(end_idx, len(scores_tensor_cpu))
+                            all_scores_list_cpu.append(scores_tensor_cpu[current_idx:actual_end_idx])
+                            current_idx = actual_end_idx
+                            if current_idx >= len(scores_tensor_cpu): break # Exit if all scores consumed
+
+                        total_samples_processed = len(scores_tensor_cpu)
+                        accelerator.print(f"Rank {accelerator.process_index}: _calculate_self_edit_rewards finished.")
+
                     except Exception as e:
-                        accelerator.print(f"Rank {accelerator.process_index}: Error calling reward fn: {e}")
-                        raise e
+                        accelerator.print(f"Rank {accelerator.process_index}: Error during _calculate_self_edit_rewards: {e}")
+                        # Attempt to restore optimizer state even on error
+                        if main_optimizer_state_memory is not None:
+                            try:
+                                accelerator.print(f"Rank {accelerator.process_index}: Attempting to restore optimizer state after self-edit error...")
+                                # FSDP Note: Loading sharded state might require accelerator specific methods if available,
+                                # or careful handling if loading a full state dict. Assuming direct load works for now.
+                                self.optimizer.load_state_dict(main_optimizer_state_memory)
+                                accelerator.print(f"Rank {accelerator.process_index}: Optimizer state restored after self-edit error.")
+                            except Exception as restore_e:
+                                accelerator.print(f"CRITICAL WARNING: Failed to restore optimizer state after self-edit error: {restore_e}")
+                        raise e # Re-raise the original error
 
-                    if not isinstance(k_scores_list, list) or len(k_scores_list) != args.rloo_k:
-                        raise ValueError(f"Reward function must return a list of {args.rloo_k} floats. Got: {k_scores_list}")
-                    try:
-                        k_scores_float = [float(s) for s in k_scores_list]
-                    except (ValueError, TypeError) as e:
-                        raise ValueError(f"Reward function must return floats. Got: {k_scores_list}. Error: {e}")
+                else: # Use external reward function (original logic)
+                    accelerator.print(f"Rank {accelerator.process_index}: Using external reward_fn...")
+                    current_text_idx = 0
+                    for i in range(num_micro_batches):
+                        # Extract data for this micro-batch
+                        local_response_ids_cpu = all_response_ids_list_cpu[i]
+                        local_sequence_lengths_cpu = all_sequence_lengths_list_cpu[i]
+                        local_bs_micro = local_response_ids_cpu.shape[0] // args.rloo_k
+                        local_scores_cpu = torch.zeros(local_bs_micro * args.rloo_k, dtype=torch.float)
 
-                    local_scores_cpu[current_score_idx : current_score_idx + args.rloo_k] = torch.tensor(k_scores_float, dtype=torch.float)
-                    current_score_idx += args.rloo_k
-                    current_text_idx += args.rloo_k # Move text index forward by k
+                        current_score_idx = 0
+                        for prompt_idx in range(local_bs_micro):
+                            # Extract corresponding texts
+                            prompt_text = all_prompts_text_list_cpu[current_text_idx // args.rloo_k]
+                            target = all_targets_list_cpu[current_text_idx // args.rloo_k]
+                            k_completions = all_processed_responses_text_list_cpu[current_text_idx : current_text_idx + args.rloo_k]
 
-                # --- Apply EOS Penalty (using CPU tensors for this micro-batch) ---
-                contain_eos_token = torch.any(
-                    (local_response_ids_cpu == self.processing_class.eos_token_id) &
-                    (torch.arange(local_response_ids_cpu.shape[1]) <= local_sequence_lengths_cpu.unsqueeze(1)),
-                    dim=1
-                )
-                if args.missing_eos_penalty is not None:
-                    local_scores_cpu[~contain_eos_token] -= args.missing_eos_penalty
+                            # Call external reward function
+                            try:
+                                reward_kwargs = self.reward_fn_kwargs.copy()
+                                import inspect
+                                sig = inspect.signature(self.reward_fn)
+                                if 'target' in sig.parameters: reward_kwargs['target'] = target
+                                else: reward_kwargs.pop('target', None) # Avoid passing if not expected
 
-                # Append the calculated scores for this micro-batch to the main list
-                all_scores_list_cpu.append(local_scores_cpu)
-                total_samples_processed += len(local_scores_cpu)
+                                k_scores_list = self.reward_fn(
+                                    prompt_text=prompt_text, completions_text=k_completions, **reward_kwargs
+                                )
+                            except Exception as e:
+                                accelerator.print(f"Rank {accelerator.process_index}: Error calling external reward fn: {e}")
+                                raise e
+
+                            # Validate and store scores
+                            if not isinstance(k_scores_list, list) or len(k_scores_list) != args.rloo_k:
+                                raise ValueError(f"External reward function must return a list of {args.rloo_k} floats. Got: {k_scores_list}")
+                            try: k_scores_float = [float(s) for s in k_scores_list]
+                            except (ValueError, TypeError) as e: raise ValueError(f"External reward function must return floats. Got: {k_scores_list}. Error: {e}")
+
+                            local_scores_cpu[current_score_idx : current_score_idx + args.rloo_k] = torch.tensor(k_scores_float, dtype=torch.float)
+                            current_score_idx += args.rloo_k
+                            current_text_idx += args.rloo_k
+
+                        # Apply EOS Penalty (per micro-batch)
+                        contain_eos_token = torch.any(
+                            (local_response_ids_cpu == self.processing_class.eos_token_id) &
+                            (torch.arange(local_response_ids_cpu.shape[1]) <= local_sequence_lengths_cpu.unsqueeze(1)),
+                            dim=1
+                        )
+                        if args.missing_eos_penalty is not None:
+                            local_scores_cpu[~contain_eos_token] -= args.missing_eos_penalty
+
+                        all_scores_list_cpu.append(local_scores_cpu)
+                        total_samples_processed += len(local_scores_cpu)
+
+            # --- End no_grad block ---
+
+            # Restore optimizer state from CPU if it was offloaded
+            if main_optimizer_state_memory is not None:
+                accelerator.print(f"Rank {accelerator.process_index}: Reloading main optimizer state from CPU.")
+                try:
+                    set_optimizer_state_dict(
+                        model=self.model,
+                        optimizers=self.optimizer,
+                        optim_state_dict=main_optimizer_state_memory,
+                    )
+
+                    original_hyperparams = {}
+                    if hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
+                         default_lr = getattr(self.args, "learning_rate", 1e-5) # Example default
+                         default_betas = (getattr(self.args, "adam_beta1", 0.9), getattr(self.args, "adam_beta2", 0.999)) # Example default
+                         default_eps = getattr(self.args, "adam_epsilon", 1e-8) # Example default
+                         default_weight_decay = getattr(self.args, "weight_decay", 0.0) # Example default
+
+                         for group in self.optimizer.param_groups:
+                             group.setdefault('lr', default_lr)
+                             group.setdefault('betas', default_betas)
+                             group.setdefault('eps', default_eps)
+                             group.setdefault('weight_decay', default_weight_decay)
+                             # Add other relevant hyperparams if needed (e.g., amsgrad)
+                             if not 'betas' in group: # Explicit check after setdefault
+                                  accelerator.print(f"CRITICAL WARNING: 'betas' still missing in param_group after setdefault attempt.")
+                    accelerator.print(f"Rank {accelerator.process_index}: Optimizer state reloaded. Param group keys: {self.optimizer.param_groups[0].keys() if self.optimizer.param_groups else 'None'}")
+
+                    # accelerator.print(f"Rank {accelerator.process_index}: Optimizer state reloaded successfully.")
+                    del main_optimizer_state_memory # Clear memory
+                    gc.collect() # Encourage garbage collection
+                except Exception as e:
+                    accelerator.print(f"CRITICAL WARNING: Failed to reload optimizer state: {e}. Training might be compromised.")
+                    raise e # Stop training if restore fails
 
             accelerator.print(f"Rank {accelerator.process_index}: Reward calculation phase finished in {time.time() - reward_calc_start_time:.2f}s. Processed {total_samples_processed} samples.")
             del temp_response_ids_full_cpu, temp_sequence_lengths_full_cpu # Clean up temps
@@ -1456,8 +1621,8 @@ class RLOOIndirectTrainer(Trainer):
                 if not unload_success:
                     print(f"Warning: Failed to unload adapter '{adapter_name_to_use}' via API. It might remain loaded on the server.")
             # Ensure other processes wait if the main process is doing API calls
-            if self.accelerator.num_processes > 1:
-                 self.accelerator.wait_for_everyone()
+            # if self.accelerator.num_processes > 1:
+            #     self.accelerator.wait_for_everyone()
 
     def create_model_card(
         self,
