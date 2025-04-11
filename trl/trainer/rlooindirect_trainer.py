@@ -808,25 +808,6 @@ class RLOOIndirectTrainer(Trainer):
             # --- Reward Calculation Phase (using accumulated data) ---
             reward_calc_start_time = time.time()
             accelerator.print(f"Rank {accelerator.process_index}: Starting reward calculation phase...")
-            # Note: all_*_list_cpu variables contain data accumulated over gradient_accumulation_steps
-
-            # Store optimizer state on CPU before reward calculation if self-editing
-            main_optimizer_state_memory = None
-            accelerator.print(f"Rank {accelerator.process_index}: Offloading main optimizer state to CPU for self-edit reward calculation.")
-            try:
-                options = StateDictOptions(cpu_offload=True)
-                main_optimizer_state_memory = get_optimizer_state_dict(
-                    model=self.model, # Pass the Accelerator-prepared model
-                    optimizers=self.optimizer,
-                    options=options
-                )
-                accelerator.print(f"Rank {accelerator.process_index}: Optimizer state retrieved (potentially offloaded to CPU).")
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                    accelerator.print(f"CRITICAL ERROR: Failed to get optimizer state: {e}. Aborting.")
-                    raise e
 
             accelerator.print(f"Rank {accelerator.process_index}: Aggregating data for single external reward_fn call...")
 
@@ -909,36 +890,6 @@ class RLOOIndirectTrainer(Trainer):
             if args.missing_eos_penalty is not None:
                 batch_scores_cpu[~contain_eos_token] -= args.missing_eos_penalty
 
-            # Restore optimizer state from CPU if it was offloaded
-            if main_optimizer_state_memory is not None:
-                accelerator.print(f"Rank {accelerator.process_index}: Reloading main optimizer state from CPU.")
-                try:
-                    set_optimizer_state_dict(
-                        model=self.model,
-                        optimizers=self.optimizer,
-                        optim_state_dict=main_optimizer_state_memory,
-                    )
-
-                    # Restore default hyperparameters if necessary (as before)
-                    if hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
-                         default_lr = getattr(self.args, "learning_rate", 1e-5)
-                         default_betas = (getattr(self.args, "adam_beta1", 0.9), getattr(self.args, "adam_beta2", 0.999))
-                         default_eps = getattr(self.args, "adam_epsilon", 1e-8)
-                         default_weight_decay = getattr(self.args, "weight_decay", 0.0)
-                         for group in self.optimizer.param_groups:
-                             group.setdefault('lr', default_lr)
-                             group.setdefault('betas', default_betas)
-                             group.setdefault('eps', default_eps)
-                             group.setdefault('weight_decay', default_weight_decay)
-                             if 'betas' not in group:
-                                  accelerator.print(f"CRITICAL WARNING: 'betas' still missing in param_group after setdefault attempt.")
-                    accelerator.print(f"Rank {accelerator.process_index}: Optimizer state reloaded. Param group keys: {self.optimizer.param_groups[0].keys() if self.optimizer.param_groups else 'None'}")
-                    del main_optimizer_state_memory # Clear memory
-                    gc.collect() # Encourage garbage collection
-                except Exception as e:
-                    accelerator.print(f"CRITICAL WARNING: Failed to reload optimizer state: {e}. Training might be compromised.")
-                    raise e # Stop training if restore fails
-
             accelerator.print(f"Rank {accelerator.process_index}: Reward calculation phase finished in {time.time() - reward_calc_start_time:.2f}s. Processed {expected_total_completions} samples.")
             # Clean up temporary aggregated tensors/lists used for EOS penalty
             del batch_response_ids_cpu, batch_sequence_lengths_cpu
@@ -960,7 +911,7 @@ class RLOOIndirectTrainer(Trainer):
                 local_total_samples_in_batch = len(batch_scores)
                 # Ensure consistency check
                 if local_total_samples_in_batch != expected_total_completions:
-                     accelerator.print(f"Warning: Collated batch size {local_total_samples_in_batch} does not match expected {expected_total_completions}")
+                    accelerator.print(f"Warning: Collated batch size {local_total_samples_in_batch} does not match expected {expected_total_completions}")
 
             except RuntimeError as e:
                 accelerator.print(f"Rank {accelerator.process_index}: Error during collation: {e}. Check accumulated data shapes.")
