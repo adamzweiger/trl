@@ -60,8 +60,8 @@ class RLOOIndirectConfig(TrainingArguments):
             Dictionary of keyword arguments to pass to the external reward function (`reward_fn`).
         num_ppo_epochs (`int`, *optional*, defaults to `1`):
             Number of optimization epochs per batch of generated data. Typically 1 for RLOO as new data is generated in each step.
-        should_self_edit (`bool`, *optional*, defaults to `False`):
-            Whether to use self-editing in the reward function. If `True`, the internal reward function will be called rather than the specified reward_fn_path.
+        task_type (`str`, *optional*, defaults to `math`):
+            Can be either `math`, `fewshot`, or `cpt`. This is used to determine the type of task for which the reward function is being defined.
 
         > Parameters specific to PEFT (LoRA)
 
@@ -184,11 +184,10 @@ class RLOOIndirectConfig(TrainingArguments):
     num_ppo_epochs: int = field(
         default=1, metadata={"help": "Number of optimization epochs per batch of generated data (usually 1 for RLOO)."}
     )
-
-    should_self_edit: bool = field(
-        default=False,
+    task_type: str = field(
+        default="math",
         metadata={
-            "help": "Whether to use self-editing in the reward function. If `True`, the internal reward function will be called instead of the external one."
+            "help": "Task type for the reward function. Can be 'math', 'fewshot', or 'cpt'."
         },
     )
 
