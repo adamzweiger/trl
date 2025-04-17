@@ -68,8 +68,8 @@ _import_structure = {
     "rloo_trainer": ["RLOOTrainer"],
     "rlooindirect_config": ["RLOOIndirectConfig"],
     "rlooindirect_trainer": ["RLOOIndirectTrainer"],
-    "rlooselfedit_config": ["RLOOSelfEditConfig"],
-    "rlooselfedit_trainer": ["RLOOSelfEditTrainer"],
+    "rlooindirect_config_new": ["RLOOIndirectConfig2"],
+    "rlooindirect_trainer_new": ["RLOOIndirectTrainer2"],
     "sft_config": ["SFTConfig"],
     "sft_trainer": ["SFTTrainer"],
     "utils": [
@@ -143,8 +143,8 @@ if TYPE_CHECKING:
     from .rloo_trainer import RLOOTrainer
     from .rlooindirect_config import RLOOIndirectConfig
     from .rlooindirect_trainer import RLOOIndirectTrainer
-    from .rlooselfedit_config import RLOOSelfEditConfig
-    from .rlooselfedit_trainer import RLOOSelfEditTrainer
+    from .rlooindirect_config_new import RLOOIndirectConfig2
+    from .rlooindirect_trainer_new import RLOOIndirectTrainer2
     from .sft_config import SFTConfig
     from .sft_trainer import SFTTrainer
     from .utils import (

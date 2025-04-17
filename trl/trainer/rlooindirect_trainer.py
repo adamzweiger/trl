@@ -15,14 +15,16 @@
 import gc
 import math
 import os
-import textwrap
+import zmq
 import time
+import json
+import textwrap
 import importlib.util
 import warnings
 import requests
 from collections import defaultdict
 from typing import Callable, Optional, Union, Dict, Any, List
-
+ 
 import numpy as np
 import pandas as pd
 import torch
@@ -65,12 +67,12 @@ if is_peft_available():
     from peft import LoraConfig, PeftModel, get_peft_model
 else:
     raise ImportError("PEFT is required for RLOOIndirectTrainer. Please install peft.")
-
+ 
 if is_wandb_available():
     import wandb
 
 INVALID_LOGPROB = 1.0
-
+ 
 # Type hint for the external reward function
 RewardFnType = Callable[
     [
@@ -83,6 +85,48 @@ RewardFnType = Callable[
     ],
     List[List[float]]              # Returns list of lists of scores
 ]
+
+def log_on_all_ranks(accelerator, message):
+    """Prints a message prefixed with the rank index on all processes."""
+    print(f"[Rank {accelerator.process_index}] {message}")
+    # Optional: Add a barrier if you want to strictly synchronize output order,
+    # but it can slow things down. Print buffering usually handles it ok.
+    # accelerator.wait_for_everyone()
+
+def safe_stats(tensor: Optional[torch.Tensor], name: str = "") -> Dict[str, float]:
+    """Calculates safe mean, std, min, max, filtering NaNs/Infs."""
+    stats = {'mean': float('nan'), 'std': float('nan'), 'min': float('nan'), 'max': float('nan'), 'numel': 0, 'num_nan': 0, 'num_inf': 0}
+    prefix = f"{name}_" if name else ""
+
+    if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+        stats_named = {f"{prefix}{k}": v for k, v in stats.items()}
+        return stats_named
+
+    try:
+        t_float = tensor.detach().float() # Work with float32 for stats
+        stats['numel'] = t_float.numel()
+
+        nan_mask = torch.isnan(t_float)
+        inf_mask = torch.isinf(t_float)
+        valid_mask = ~nan_mask & ~inf_mask
+
+        stats['num_nan'] = nan_mask.sum().item()
+        stats['num_inf'] = inf_mask.sum().item()
+
+        valid_tensor = t_float[valid_mask]
+
+        if valid_tensor.numel() > 0:
+            stats['mean'] = valid_tensor.mean().item()
+            stats['std'] = valid_tensor.std().item() if valid_tensor.numel() > 1 else 0.0
+            stats['min'] = valid_tensor.min().item()
+            stats['max'] = valid_tensor.max().item()
+    except Exception as e:
+        print(f"[WARN] Error calculating stats for tensor '{name}': {e}")
+        # Return stats as they are (likely NaNs)
+
+    stats_named = {f"{prefix}{k}": v for k, v in stats.items()}
+    return stats_named
+
 
 class RLOOIndirectTrainer(Trainer):
     """
@@ -223,11 +267,6 @@ class RLOOIndirectTrainer(Trainer):
             args.stop_token_id = self.processing_class.eos_token_id
 
         # --- Reward Function Loading ---
-        self.reward_fn = None
-        if not args.reward_fn_path:
-                raise ValueError("reward_fn_path must be provided.")
-        self.reward_fn = self._load_reward_function(args.reward_fn_path)
-        print("Loaded external reward function.")
         self.reward_fn_kwargs = args.reward_fn_kwargs or {}
 
         # --- vLLM API Client ---
@@ -248,19 +287,10 @@ class RLOOIndirectTrainer(Trainer):
             self.model, self.optimizer, train_dataloader, eval_dataloader, self.lr_scheduler
         )
 
-        # debug start
-        accelerator.print("--- Initial Optimizer State After Prepare ---")
-        accelerator.print(f"Optimizer Type: {type(self.optimizer)}")
-        # If wrapped by AcceleratedOptimizer, access the original via .optimizer
-        if hasattr(self.optimizer, 'optimizer'):
-            accelerator.print(f"Wrapped Optimizer Type: {type(self.optimizer.optimizer)}")
-            accelerator.print(f"Wrapped Optimizer Param Groups: {self.optimizer.optimizer.param_groups}")
-            accelerator.print(f"Wrapped Optimizer Defaults: {self.optimizer.optimizer.defaults}")
-        else:
-            accelerator.print(f"Optimizer Param Groups: {self.optimizer.param_groups}")
-            accelerator.print(f"Optimizer Defaults: {self.optimizer.defaults}")
-        accelerator.print("-" * 40)
-        # debug end
+        # --- ZMQ Server ---
+        # self.zmq_context = zmq.Context()
+        # self.zmq_socket = self.zmq_context.socket(zmq.REQ)
+        # self.zmq_socket.connect("tcp://localhost:5555")
 
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
@@ -301,17 +331,6 @@ class RLOOIndirectTrainer(Trainer):
         self.accelerator.wait_for_everyone()
 
         print(f"[Process Index {self.args.process_index}] RLOOIndirectTrainer initialization finished.")
-
-    def _load_reward_function(self, path: str) -> RewardFnType:
-        """Loads the `reward_fn` function from the specified Python file."""
-        spec = importlib.util.spec_from_file_location("reward_module", path)
-        if spec is None:
-            raise ImportError(f"Could not load spec for module at path: {path}")
-        reward_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(reward_module)
-        if not hasattr(reward_module, "reward_fn"):
-            raise AttributeError(f"File at {path} must define a function named 'reward_fn'.")
-        return reward_module.reward_fn
 
     def _load_adapter_via_api(self, adapter_path: str, adapter_name: str) -> bool:
         """Dynamically loads or updates an adapter via the vLLM API."""
@@ -390,9 +409,11 @@ class RLOOIndirectTrainer(Trainer):
 
         all_generated_texts = []
         max_retries = 3
+        # make the timeout dependent on the n and number of prompts
+        timeout_threshold = len(prompts_text) * sampling_params.get("n", 1) * 60
         for attempt in range(max_retries):
             try:
-                response = self.api_session.post(completions_url, json=payload, headers=headers, timeout=180) # Long timeout for generation
+                response = self.api_session.post(completions_url, json=payload, headers=headers, timeout=timeout_threshold) # Long timeout for generation
                 response.raise_for_status()
                 response_data = response.json()
 
@@ -475,7 +496,7 @@ class RLOOIndirectTrainer(Trainer):
         )
 
 
-    def train_RL(self):
+    def train(self):
         """Main training loop."""
         args = self.args
         accelerator = self.accelerator
@@ -568,6 +589,15 @@ class RLOOIndirectTrainer(Trainer):
         except Exception as e:
             accelerator.print(f"Rank {accelerator.process_index}: Error during initial adapter saving: {e}")
             raise e
+        
+        # --- Initial Evaluation ---
+        if args.eval_steps > 0 and self.eval_dataloader is not None:
+            self.accelerator.print("Running initial evaluation before training...")
+            self.evaluate(global_step=0)
+            # evaluate method already sets model back to train() and syncs
+            self.accelerator.print("Initial evaluation finished.")
+        else:
+            self.accelerator.print("Skipping initial evaluation (eval_steps <= 0 or no eval_dataloader).")
 
         # --- Training Loop ---
         for step in range(max_steps):
@@ -622,7 +652,8 @@ class RLOOIndirectTrainer(Trainer):
                     raise ValueError(f"Invalid task type '{self.task_type}' encountered in training loop.")
 
                 local_bs = len(local_prompts_text)
-                accelerator.print(f"Rank {accelerator.process_index}, Step {step}, MicroStep {micro_step+1}/{args.gradient_accumulation_steps}: Got batch.")
+                # accelerator.print(f"Rank {accelerator.process_index}, Step {step}, MicroStep {micro_step+1}/{args.gradient_accumulation_steps}: Got batch.")
+                accelerator.print(f"[Step {step+1}, Micro {micro_step+1} INFO] Rank {accelerator.process_index} got batch size {local_bs}.")
 
                 # --- vLLM Generation via API (using adapter loaded for this step) ---
                 sampling_params_dict = {
@@ -642,12 +673,12 @@ class RLOOIndirectTrainer(Trainer):
 
                 if accelerator.is_main_process:
                     if len(all_prompts_text_gathered) != global_num_prompts:
-                         accelerator.print(f"Warning: Gathered prompt list size mismatch on main process. Got {len(all_prompts_text_gathered)}, expected {global_num_prompts}")
-                         # Pad or truncate if necessary, although this indicates an issue
-                         if len(all_prompts_text_gathered) < global_num_prompts:
-                             all_prompts_text_gathered.extend(["[PAD PROMPT]"] * (global_num_prompts - len(all_prompts_text_gathered)))
-                         else:
-                             all_prompts_text_gathered = all_prompts_text_gathered[:global_num_prompts]
+                        accelerator.print(f"Warning: Gathered prompt list size mismatch on main process. Got {len(all_prompts_text_gathered)}, expected {global_num_prompts}")
+                        # Pad or truncate if necessary, although this indicates an issue
+                        if len(all_prompts_text_gathered) < global_num_prompts:
+                            all_prompts_text_gathered.extend(["[PAD PROMPT]"] * (global_num_prompts - len(all_prompts_text_gathered)))
+                        else:
+                            all_prompts_text_gathered = all_prompts_text_gathered[:global_num_prompts]
 
 
                     flat_generated_responses_text_global = self._generate_via_vllm_api(
@@ -657,10 +688,10 @@ class RLOOIndirectTrainer(Trainer):
                     )
                     actual_len = len(flat_generated_responses_text_global)
                     if actual_len != expected_global_completions:
-                         accelerator.print(f"Warning: vLLM returned {actual_len} completions, expected {expected_global_completions}. Padding/Truncating.")
-                         if actual_len < expected_global_completions:
+                        accelerator.print(f"Warning: vLLM returned {actual_len} completions, expected {expected_global_completions}. Padding/Truncating.")
+                        if actual_len < expected_global_completions:
                             flat_generated_responses_text_global.extend([""] * (expected_global_completions - actual_len))
-                         else:
+                        else:
                             flat_generated_responses_text_global = flat_generated_responses_text_global[:expected_global_completions]
                 else:
                     # Allocate space on non-main processes
@@ -671,7 +702,7 @@ class RLOOIndirectTrainer(Trainer):
                 broadcast_object_list(object_list_to_broadcast, from_process=0)
                 flat_generated_responses_text_global = object_list_to_broadcast[0]
                 accelerator.print(f"Rank {accelerator.process_index}: Synced {len(flat_generated_responses_text_global)} completions.")
-
+                accelerator.print(f"[Step {step+1}, Micro {micro_step+1} INFO] Rank {accelerator.process_index} synced {len(flat_generated_responses_text_global)} completions from API.")
 
                 # --- Process Generated Responses (Locally) ---
                 local_start_idx = accelerator.process_index * local_bs * args.rloo_k
@@ -695,9 +726,10 @@ class RLOOIndirectTrainer(Trainer):
                     local_processed_responses_ids = truncate_response(
                         args.stop_token_id, self.processing_class.pad_token_id, local_responses_ids
                     )
+                accelerator.print(f"[Step {step+1}, Micro {micro_step+1} DEBUG] Rank {accelerator.process_index} Processed responses shape: {local_processed_responses_ids.shape}")
 
                 # --- Calculate Reference Logprobs (Adapter Disabled, No Gradients) ---
-                accelerator.print(f"Rank {accelerator.process_index}: Calculating reference logprobs...")
+                accelerator.print(f"[Step {step+1}, Micro {micro_step+1} INFO] Rank {accelerator.process_index} Calculating reference logprobs...")
                 local_queries_repeated = local_prompts_ids.repeat_interleave(args.rloo_k, dim=0)
                 local_context_length = local_queries_repeated.shape[1]
                 local_query_responses_ids = torch.cat([local_queries_repeated, local_processed_responses_ids], dim=1)
@@ -731,6 +763,9 @@ class RLOOIndirectTrainer(Trainer):
                             ref_logits /= (args.temperature + 1e-7)
                             local_ref_logprobs = selective_log_softmax(ref_logits, local_processed_responses_ids) # Shape: (bs*k, resp_len)
 
+                            ref_logp_stats = safe_stats(local_ref_logprobs, "ref_logp_token")
+                            accelerator.print(f"[Step {step+1}, Micro {micro_step+1} DEBUG] Rank {accelerator.process_index} Ref LogP Stats: {ref_logp_stats}")
+
                             del ref_outputs, ref_logits
 
                         finally:
@@ -745,12 +780,12 @@ class RLOOIndirectTrainer(Trainer):
                     accelerator.print(traceback.format_exc())
                     # Attempt re-enable even on error
                     if adapters_disabled and peft_model_instance_ref is not None:
-                         try:
-                             accelerator.print(f"Rank {accelerator.process_index}: Attempting adapter re-enable after exception...")
-                             peft_model_instance_ref.enable_adapter_layers()
-                             accelerator.print(f"Rank {accelerator.process_index}: Adapters re-enabled after exception.")
-                         except Exception as re_enable_e:
-                             accelerator.print(f"Rank {accelerator.process_index}: Error during adapter re-enable after exception: {re_enable_e}")
+                        try:
+                            accelerator.print(f"Rank {accelerator.process_index}: Attempting adapter re-enable after exception...")
+                            peft_model_instance_ref.enable_adapter_layers()
+                            accelerator.print(f"Rank {accelerator.process_index}: Adapters re-enabled after exception.")
+                        except Exception as re_enable_e:
+                            accelerator.print(f"Rank {accelerator.process_index}: Error during adapter re-enable after exception: {re_enable_e}")
                     raise e
 
                 accelerator.print(f"Rank {accelerator.process_index}: Reference logprobs calculation block finished.")
@@ -760,12 +795,16 @@ class RLOOIndirectTrainer(Trainer):
                 # --- Prepare and Store Data on CPU for Batched Reward & Optimization Later ---
                 local_sequence_lengths = first_true_indices(local_processed_responses_ids == self.processing_class.pad_token_id) - 1
                 local_padding_mask = torch.arange(local_processed_responses_ids.shape[1], device=device) > local_sequence_lengths.unsqueeze(1)
-                local_ref_logprobs = torch.masked_fill(local_ref_logprobs, local_padding_mask, INVALID_LOGPROB) # Mask padded ref logprobs
+                local_ref_logprobs = torch.masked_fill(local_ref_logprobs, local_padding_mask, 0.0) # Mask padded ref logprobs
 
                 # Decode text responses needed for batched reward function later
                 local_processed_responses_text = self.processing_class.batch_decode(
                     local_processed_responses_ids, skip_special_tokens=True
                 )
+
+                local_ref_logprobs_sum = local_ref_logprobs.sum(1)
+                ref_logp_sum_stats = safe_stats(local_ref_logprobs_sum, "ref_logp_sum")
+                accelerator.print(f"[Step {step+1}, Micro {micro_step+1} DEBUG] Rank {accelerator.process_index} Ref LogP Sum Stats: {ref_logp_sum_stats}")
 
                 # Store necessary data on CPU lists
                 all_query_ids_list_cpu.append(local_queries_repeated.cpu())
@@ -779,11 +818,11 @@ class RLOOIndirectTrainer(Trainer):
 
                 # --- Micro-step cleanup ---
                 del (raw_batch, local_prompts_ids, local_prompts_text, local_task_specific_data,
-                     local_generated_responses_text, responses_tokenized, local_responses_ids,
-                     local_processed_responses_ids, local_queries_repeated, local_query_responses_ids,
-                     local_query_mask, local_resp_attn_mask, local_query_responses_mask,
-                     local_ref_logprobs, local_processed_responses_text, # Removed local_scores
-                     local_sequence_lengths, local_padding_mask)
+                    local_generated_responses_text, responses_tokenized, local_responses_ids,
+                    local_processed_responses_ids, local_queries_repeated, local_query_responses_ids,
+                    local_query_mask, local_resp_attn_mask, local_query_responses_mask,
+                    local_ref_logprobs, local_processed_responses_text, # Removed local_scores
+                    local_sequence_lengths, local_padding_mask, local_ref_logprobs_sum)
                 # Less aggressive cache clearing
                 if micro_step % 8 == 0:
                     gc.collect()
@@ -801,7 +840,7 @@ class RLOOIndirectTrainer(Trainer):
                 accelerator.print(f"[Step {step+1}/{max_steps}] Unloading adapter '{self.vllm_adapter_name}' at end of step...")
                 unload_success = self._unload_adapter_via_api(self.vllm_adapter_name)
                 if not unload_success:
-                     accelerator.print(f"Warning: Failed to unload adapter '{self.vllm_adapter_name}' at end of step {step+1}.")
+                    accelerator.print(f"Warning: Failed to unload adapter '{self.vllm_adapter_name}' at end of step {step+1}.")
             # Sync after potential unload attempt before optimization
             accelerator.wait_for_everyone()
 
@@ -839,14 +878,30 @@ class RLOOIndirectTrainer(Trainer):
             try:
                 reward_kwargs = self.reward_fn_kwargs.copy()
                 # Pass the aggregated lists directly
-                nested_scores_list = self.reward_fn(
-                    prompt_texts=all_prompts,
-                    completions_texts=all_nested_completions,
-                    task_type=self.task_type,
-                    task_specific_data=all_task_specific_data,
-                    trainer_class=self,
+
+                # Prepare the message to send
+                message = {
+                    "prompt_texts": all_prompts,
+                    "completions_texts": all_nested_completions,
+                    "task_type": self.task_type,
+                    "task_specific_data": all_task_specific_data,
+                    "trainer_class": str(self),  # Convert to string for serialization
                     **reward_kwargs
-                )
+                }
+                # Send the message via ZMQ
+                # self.zmq_socket.send_json(message)
+                # # Receive the response
+                # response = self.zmq_socket.recv_json()
+                # print(f"Received response: {response}")
+                # nested_scores_list = response.get("rewards", None)
+                target_length = 1024.0
+                nested_scores_list = [
+                    [
+                        max(0.0, 1.0 - (abs(len(self.processing_class.encode(completion_text, add_special_tokens=False)) - target_length) / target_length))
+                        for completion_text in completions_for_prompt
+                    ]
+                    for completions_for_prompt in all_nested_completions
+                ] # Dummy based on token count difference from 512, clamped at 0
             except Exception as e:
                 accelerator.print(f"Rank {accelerator.process_index}: Error calling external reward fn: {e}")
                 import traceback
@@ -870,8 +925,11 @@ class RLOOIndirectTrainer(Trainer):
             # Convert the final flattened list of scores to a tensor
             batch_scores_cpu = torch.tensor(flat_scores, dtype=torch.float)
             if batch_scores_cpu.shape != (expected_total_completions,):
-                 raise ValueError(f"Internal error: Shape mismatch after flattening scores. Expected ({expected_total_completions},), got {batch_scores_cpu.shape}")
+                raise ValueError(f"Internal error: Shape mismatch after flattening scores. Expected ({expected_total_completions},), got {batch_scores_cpu.shape}")
 
+            if accelerator.is_main_process:
+                score_stats = safe_stats(batch_scores_cpu, "raw_scores_cpu")
+                accelerator.print(f"[Step {step+1} DEBUG] Raw Scores (CPU) Stats: {score_stats}")
 
             # --- Apply EOS Penalty (to the full batch) ---
             # Collate response IDs and sequence lengths from all micro-batches first
@@ -893,6 +951,10 @@ class RLOOIndirectTrainer(Trainer):
             accelerator.print(f"Rank {accelerator.process_index}: Reward calculation phase finished in {time.time() - reward_calc_start_time:.2f}s. Processed {expected_total_completions} samples.")
             # Clean up temporary aggregated tensors/lists used for EOS penalty
             del batch_response_ids_cpu, batch_sequence_lengths_cpu
+
+            if accelerator.is_main_process:
+                score_pen_stats = safe_stats(batch_scores_cpu, "scores_eos_penalty_cpu")
+                accelerator.print(f"[Step {step+1} DEBUG] Scores w/ Penalty (CPU) Stats: {score_pen_stats}")
 
             # --- Optimization Phase (Policy Forward/Backward) ---
             if batch_scores_cpu is None: # Check if scores were actually calculated (should always be non-None now)
@@ -924,6 +986,11 @@ class RLOOIndirectTrainer(Trainer):
                 all_prompts_text_list_cpu, all_task_specific_data_list_cpu, all_processed_responses_text_list_cpu) # Clear text lists too
             gc.collect()
 
+            accelerator.print(f"[Step {step+1} DEBUG] Collated batch shapes on Rank {accelerator.process_index}:")
+            accelerator.print(f"  Query IDs: {batch_query_ids.shape}, Response IDs: {batch_response_ids.shape}")
+            accelerator.print(f"  Ref LogP Sum: {batch_ref_logprobs_sum.shape}, Scores: {batch_scores.shape}")
+            accelerator.print(f"  Seq Lengths: {batch_seq_lengths.shape}")
+
             # Recompute policy logprobs *with gradients enabled* within the accelerator context
             with accelerator.accumulate(self.model):
                 optim_start_time = time.time()
@@ -953,17 +1020,24 @@ class RLOOIndirectTrainer(Trainer):
                 logits /= (args.temperature + 1e-7) # Apply temperature scaling
 
                 new_logprobs_token = selective_log_softmax(logits, mb_response_ids) # Shape: (batch_total, resp_len)
+                policy_logp_stats = safe_stats(new_logprobs_token, "policy_logp_token")
+                accelerator.print(f"[Step {step+1}, Optim DEBUG] Policy LogP Stats: {policy_logp_stats}")
 
                 # Apply padding mask (use > to exclude padding tokens from sum)
                 mb_padding_mask = mb_response_idxs > mb_seq_lengths.unsqueeze(1)
                 new_logprobs_token_masked = torch.masked_fill(new_logprobs_token, mb_padding_mask, 0.0)
                 new_logprobs_sum = new_logprobs_token_masked.sum(1) # Sum over sequence length
+                policy_logp_sum_stats = safe_stats(new_logprobs_sum, "policy_logp_sum")
+                accelerator.print(f"[Step {step+1}, Optim DEBUG] Policy LogP Sum Stats: {policy_logp_sum_stats}")
 
                 # --- Compute Advantages ---
                 kl_sum = new_logprobs_sum - mb_ref_logprobs_sum # KL per sequence
+                kl_stats = safe_stats(kl_sum, "kl_per_seq")
+                accelerator.print(f"[Step {step+1}, Optim DEBUG] KL per sequence Stats: {kl_stats}") # CRITICAL LOG
 
                 # Normalize raw scores if needed
                 current_scores_for_norm = mb_scores.clone() # Use a clone
+                scores_before_norm_stats = safe_stats(current_scores_for_norm, "scores_before_norm")
                 if args.normalize_reward:
                     # Gather scores across all processes for mean/std calculation
                     gathered_scores_all = accelerator.gather(current_scores_for_norm).float()
@@ -976,29 +1050,38 @@ class RLOOIndirectTrainer(Trainer):
                         # Clip normalized scores
                         current_scores_for_norm = torch.clamp(current_scores_for_norm, -args.reward_clip_range, args.reward_clip_range)
                     elif valid_scores.numel() == 1:
-                         mean_score = valid_scores.mean()
-                         current_scores_for_norm = current_scores_for_norm - mean_score # Center only
-                         accelerator.print("Warning: Only one valid reward score found after gathering. Centering rewards but not scaling.")
+                        mean_score = valid_scores.mean()
+                        current_scores_for_norm = current_scores_for_norm - mean_score # Center only
+                        accelerator.print("Warning: Only one valid reward score found after gathering. Centering rewards but not scaling.")
                     else: # valid_scores.numel() == 0
-                         accelerator.print("Warning: Could not normalize rewards: No valid values gathered.")
-                         # Keep original scores if normalization failed
+                        accelerator.print("Warning: Could not normalize rewards: No valid values gathered.")
+                        # Keep original scores if normalization failed
+                    scores_after_norm_stats = safe_stats(current_scores_for_norm, "scores_after_norm")
+                    accelerator.print(f"[Step {step+1}, Optim DEBUG] Scores Stats Before Norm: {scores_before_norm_stats}")
+                    accelerator.print(f"[Step {step+1}, Optim DEBUG] Scores Stats After Norm: {scores_after_norm_stats}")
 
+                    
                 # Combine score and KL penalty
                 non_score_reward_per_seq = -args.kl_coef * kl_sum
                 rlhf_reward = non_score_reward_per_seq + current_scores_for_norm # Use potentially normalized scores
+                non_score_rew_stats = safe_stats(non_score_reward_per_seq, "non_score_reward")
+                rlhf_rew_stats = safe_stats(rlhf_reward, "rlhf_reward")
+                accelerator.print(f"[Step {step+1}, Optim DEBUG] Non-Score Reward Stats: {non_score_rew_stats}")
+                accelerator.print(f"[Step {step+1}, Optim DEBUG] RLHF Reward Stats: {rlhf_rew_stats}")
+
 
                 # Calculate RLOO baseline and advantages
                 # Ensure calculation uses the correct local batch size dimensions
                 num_prompts_in_local_batch = local_total_samples_in_batch // args.rloo_k
                 if local_total_samples_in_batch % args.rloo_k != 0:
-                     # This should ideally not happen if data loading and accumulation are correct
-                     raise ValueError(f"Total samples {local_total_samples_in_batch} not divisible by rloo_k {args.rloo_k}.")
+                    # This should ideally not happen if data loading and accumulation are correct
+                    raise ValueError(f"Total samples {local_total_samples_in_batch} not divisible by rloo_k {args.rloo_k}.")
 
                 try:
                     # Reshape assuming order [p0_s0...p0_sk-1, p1_s0...p1_sk-1, ...]
                     rlhf_reward_grouped = rlhf_reward.reshape(num_prompts_in_local_batch, args.rloo_k).transpose(0, 1) # Shape: (k, num_prompts_local)
                 except Exception as e:
-                     # Add more context to the error message
+                    # Add more context to the error message
                     raise RuntimeError(f"Failed reshape rlhf_reward. Shape: {rlhf_reward.shape}, k: {args.rloo_k}, num_prompts_local: {num_prompts_in_local_batch}, local_total_samples: {local_total_samples_in_batch}. Err: {e}")
 
 
@@ -1008,6 +1091,7 @@ class RLOOIndirectTrainer(Trainer):
                     baseline = torch.zeros_like(rlhf_reward_grouped) # No baseline if k=1
                 advantages_grouped = rlhf_reward_grouped - baseline
                 advantages = advantages_grouped.transpose(0, 1).flatten() # Shape: (local_total_samples_in_batch,)
+                adv_before_norm_stats = safe_stats(advantages, "adv_before_norm")
 
                 # Normalize advantages if needed
                 if args.normalize_advantage:
@@ -1024,12 +1108,17 @@ class RLOOIndirectTrainer(Trainer):
                     else: # No valid advantages found
                         accelerator.print("Warning: Could not normalize advantages: No valid values found after gathering.")
                         # Keep original advantages if normalization failed
+                    adv_after_norm_stats = safe_stats(advantages, "adv_after_norm")
+                    accelerator.print(f"[Step {step+1}, Optim DEBUG] Advantage Stats Before Norm: {adv_before_norm_stats}")
+                    accelerator.print(f"[Step {step+1}, Optim DEBUG] Advantage Stats After Norm: {adv_after_norm_stats}")
 
                 # --- RLOO Loss Calculation ---
                 # Detach advantages - gradients flow through logprobs only
                 pg_loss = (-advantages.detach() * new_logprobs_sum).mean()
                 loss = pg_loss
+                accelerator.print(f"[Step {step+1}, Optim INFO] Policy Loss (pg_loss): {pg_loss.item():.4f}")
 
+                accelerator.print(f"    Running backward pass with loss: {loss.item()}")
                 # Backward pass (managed by accelerator.accumulate)
                 accelerator.backward(loss)
                 optim_end_time = time.time()
@@ -1166,7 +1255,7 @@ class RLOOIndirectTrainer(Trainer):
                         )
 
                         if accelerator.is_main_process:
-                             accelerator.print(f"Rank 0: Initiated save_pretrained call to {adapter_save_subdir} for step {self.state.global_step}.")
+                            accelerator.print(f"Rank 0: Initiated save_pretrained call to {adapter_save_subdir} for step {self.state.global_step}.")
 
                         accelerator.wait_for_everyone() # Ensure save is complete before proceeding
                         accelerator.print(f"Rank {accelerator.process_index}: Adapter save completed in {time.time() - save_adapter_start_time:.2f}s.")
@@ -1175,27 +1264,20 @@ class RLOOIndirectTrainer(Trainer):
                     accelerator.print(f"Rank {accelerator.process_index}: Error during adapter saving after step {self.state.global_step}: {e}")
                     raise e # Re-raise to stop training
 
+                # --- Periodic Evaluation ---
+                # Check if evaluation is due (run on all processes, evaluate handles internal logic)
+                if args.eval_steps > 0 and self.eval_dataloader is not None and self.state.global_step % args.eval_steps == 0:
+                    self.accelerator.print(f"Running evaluation at global step {self.state.global_step}...")
+                    self.evaluate(global_step=self.state.global_step)
+                    # evaluate method sets model back to train() and syncs
+
                 # --- Callbacks, Evaluation, Checkpointing (based on global_step) ---
                 self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                if self.control.should_save:
-                    accelerator.print(f"Triggering checkpoint save at step {self.state.global_step}...")
-                    self._save_checkpoint() # Saves full training state via Accelerator
-                    self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-
-                # # Sample generation check
-                # if accelerator.is_main_process and args.num_sample_generations > 0 and \
-                #    (self.state.global_step % self.sample_generations_freq == 0 or self.control.should_training_stop):
-                #     accelerator.print(f"Generating samples at step {self.state.global_step}...")
-                #     self.model.eval()
-                #     # Ensure generate_completions uses the *current* model state (or vLLM if adapted)
-                #     self.generate_completions(sampling=True)
-                #     self.model.train()
-
-            # --- End Sync Gradients Block ---
-            # if self.control.should_training_stop:
-            #     accelerator.print("Training stopping signal received.")
-            #     break
+                # if self.control.should_save:
+                #     accelerator.print(f"Triggering checkpoint save at step {self.state.global_step}...")
+                #     self._save_checkpoint() # Saves full training state via Accelerator
+                #     self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
             step_end_time = time.time()
             accelerator.print(f"  Full step {step+1}/{max_steps} (Global Step: {self.state.global_step}) completed in {step_end_time - step_start_time:.2f}s")
@@ -1204,6 +1286,15 @@ class RLOOIndirectTrainer(Trainer):
         # --- End of Training Loop ---
         end_time = time.time()
         accelerator.print(f"Total training time: {end_time - start_time:.2f}s")
+
+        # --- Final Evaluation ---
+        if args.eval_steps > 0 and self.eval_dataloader is not None:
+            self.accelerator.print("Running final evaluation after training...")
+            self.evaluate(global_step=self.state.global_step) # Use final global step
+            self.accelerator.print("Final evaluation finished.")
+        else:
+            self.accelerator.print("Skipping final evaluation.")
+
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
         accelerator.wait_for_everyone()
         accelerator.print("=== Finished Training ===")
@@ -1235,6 +1326,256 @@ class RLOOIndirectTrainer(Trainer):
                 raise e
 
             self.accelerator.wait_for_everyone()
+
+
+    def evaluate(self, global_step: Optional[int] = None):
+        """
+        Run evaluation on the eval_dataset using the current adapter state via vLLM.
+        """
+        if self.eval_dataloader is None:
+            self.accelerator.print("No evaluation dataloader found, skipping evaluation.")
+            return
+
+        args = self.args
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        self.accelerator.print(f"--- Starting Evaluation at Global Step {global_step} ---")
+        eval_start_time = time.time()
+
+        # Ensure model is in eval mode
+        self.model.eval()
+
+        # --- Adapter Handling ---
+        # The adapter saved at the end of the *last* training step is the one we evaluate.
+        adapter_path_for_eval = os.path.join(self.adapter_save_path, self.args.lora_adapter_name)
+        adapter_loaded = False
+        try:
+            self.accelerator.print(f"Loading adapter '{self.vllm_adapter_name}' from {adapter_path_for_eval} for evaluation...")
+            adapter_loaded = self._load_adapter_via_api(adapter_path_for_eval, self.vllm_adapter_name)
+
+            # Broadcast status to ensure all processes know if loading succeeded on rank 0
+            status_list = [adapter_loaded]
+            if accelerator.num_processes > 1:
+                broadcast_object_list(status_list, from_process=0)
+            adapter_loaded = status_list[0]
+
+            if not adapter_loaded:
+                self.accelerator.print(f"Warning: Failed to load adapter '{self.vllm_adapter_name}' for evaluation. Skipping evaluation.")
+                return # Cannot proceed without adapter
+
+            self.accelerator.print(f"Adapter '{self.vllm_adapter_name}' loaded successfully for evaluation.")
+
+            all_prompts_text_list_cpu = []
+            all_completions_text_list_cpu = [] # Store single completion per prompt
+            all_task_specific_data_list_cpu = []
+
+            # --- Evaluation Loop (No Gradients) ---
+            with torch.no_grad():
+                for step, batch in enumerate(self.eval_dataloader):
+                    local_prompts_text = batch['prompt']
+                    # Extract task-specific data (same logic as training loop)
+                    local_task_specific_data = None
+                    if self.task_type in ["math", "fewshot"]:
+                        local_task_specific_data = batch['target']
+                    elif self.task_type == "cpt":
+                        local_task_specific_data = batch['questions']
+                    else:
+                        raise ValueError(f"Invalid task type '{self.task_type}' during evaluation.")
+
+                    local_bs = len(local_prompts_text)
+                    if local_bs == 0: continue # Skip empty batches
+
+                    # --- Generate ONE completion per prompt via vLLM API ---
+                    eval_sampling_params_dict = {
+                        "n": 1, # Generate only one completion for evaluation
+                        "max_tokens": args.max_completion_length,
+                        "temperature": args.temperature, # Or maybe use 0.0 for deterministic eval? args.temperature is fine.
+                        "top_p": args.top_p,
+                        "stop": [self.processing_class.eos_token] if args.stop_token_id == self.processing_class.eos_token_id else [],
+                    }
+
+                    # Gather prompts across devices for main process API call
+                    all_prompts_text_gathered = gather_object(local_prompts_text)
+                    flat_generated_responses_text_global = []
+                    global_num_prompts = args.per_device_eval_batch_size * args.world_size # Use eval batch size
+                    expected_global_completions = global_num_prompts * 1 # n=1
+
+                    print(f"Rank {accelerator.process_index}: Evaluating {global_num_prompts} prompts with {expected_global_completions} expected completions.")
+
+                    if accelerator.is_main_process:
+                        # Pad/truncate gathered prompts if necessary (shouldn't happen with drop_last=False usually)
+                        if len(all_prompts_text_gathered) != global_num_prompts:
+                            self.accelerator.print(f"Warning: Eval prompt list size mismatch. Got {len(all_prompts_text_gathered)}, expected {global_num_prompts}")
+                            while len(all_prompts_text_gathered) < global_num_prompts: all_prompts_text_gathered.append("")
+                            all_prompts_text_gathered = all_prompts_text_gathered[:global_num_prompts]
+
+                        flat_generated_responses_text_global = self._generate_via_vllm_api(
+                            all_prompts_text_gathered,
+                            self.vllm_adapter_name,
+                            eval_sampling_params_dict
+                        )
+                        actual_len = len(flat_generated_responses_text_global)
+                        if actual_len != expected_global_completions:
+                            self.accelerator.print(f"Warning: Eval vLLM returned {actual_len} completions, expected {expected_global_completions}. Padding/Truncating.")
+                            while len(flat_generated_responses_text_global) < expected_global_completions: flat_generated_responses_text_global.append("")
+                            flat_generated_responses_text_global = flat_generated_responses_text_global[:expected_global_completions]
+                    else:
+                        flat_generated_responses_text_global = [""] * expected_global_completions
+
+                    print(f"Rank {accelerator.process_index}: Received {len(flat_generated_responses_text_global)} completions from vLLM API.")
+
+                    # Broadcast generated text to all processes
+                    object_list_to_broadcast = [flat_generated_responses_text_global]
+                    broadcast_object_list(object_list_to_broadcast, from_process=0)
+                    flat_generated_responses_text_global = object_list_to_broadcast[0]
+
+                    # --- Store Data Locally (on CPU) ---
+                    local_start_idx = accelerator.process_index * args.per_device_eval_batch_size
+                    local_end_idx = local_start_idx + args.per_device_eval_batch_size
+                    local_generated_responses_text = flat_generated_responses_text_global[local_start_idx:local_end_idx]
+
+                    # No tokenization needed here, just storing text for reward function
+                    all_prompts_text_list_cpu.extend(local_prompts_text)
+                    all_completions_text_list_cpu.extend(local_generated_responses_text)
+                    all_task_specific_data_list_cpu.extend(local_task_specific_data)
+                    self.accelerator.print(f"  Eval step {step}/{len(self.eval_dataloader)}")
+
+            # --- End Evaluation Loop ---
+            self.accelerator.print("Evaluation generation finished. Aggregating data for reward calculation.")
+
+            # --- Reward Calculation Phase ---
+            # Gather all data from all processes to rank 0
+            all_prompts_gathered = gather_object(all_prompts_text_list_cpu)
+            all_completions_gathered = gather_object(all_completions_text_list_cpu)
+            all_task_data_gathered = gather_object(all_task_specific_data_list_cpu)
+
+            all_rewards_cpu = None # Placeholder
+
+            if accelerator.is_main_process:
+                total_eval_samples = len(all_prompts_gathered)
+                self.accelerator.print(f"Rank 0: Gathered {total_eval_samples} evaluation samples.")
+
+                if total_eval_samples > 0:
+                    # Reshape completions for ZMQ server (expects list of lists)
+                    # Since n=1, reshape [c1, c2, ...] to [[c1], [c2], ...]
+                    nested_completions_for_zmq = [[comp] for comp in all_completions_gathered]
+
+                    # Prepare message for ZMQ reward server
+                    reward_message = {
+                        "prompt_texts": all_prompts_gathered,
+                        "completions_texts": nested_completions_for_zmq,
+                        "task_type": self.task_type,
+                        "task_specific_data": all_task_data_gathered,
+                        "trainer_class": str(self), # Keep consistent if server uses it
+                        **self.reward_fn_kwargs
+                    }
+
+                    # Call ZMQ server
+                    try:
+                        self.accelerator.print("Sending evaluation data to ZMQ reward server...")
+                        # self.zmq_socket.send_json(reward_message)
+                        # response = self.zmq_socket.recv_json()
+                        # nested_scores_list = response.get("rewards", None)
+                        target_length = 1024.0
+                        nested_scores_list = [
+                            [
+                                max(0.0, 1.0 - (abs(len(self.processing_class.encode(completion_text, add_special_tokens=False)) - target_length) / target_length))
+                                for completion_text in completions_for_prompt
+                            ]
+                            for completions_for_prompt in nested_completions_for_zmq
+                        ] # Dummy based on token count difference from 512, clamped at 0
+
+
+                        if not isinstance(nested_scores_list, list) or len(nested_scores_list) != total_eval_samples:
+                            raise ValueError(f"ZMQ server returned invalid rewards structure. Expected list of {total_eval_samples} lists, got {len(nested_scores_list)} items.")
+
+                        # Extract the single score from each sublist [[r1], [r2], ...] -> [r1, r2, ...]
+                        flat_scores = []
+                        for idx, sublist in enumerate(nested_scores_list):
+                            if not isinstance(sublist, list) or len(sublist) != 1:
+                                raise ValueError(f"ZMQ server reward sublist for eval sample {idx} has length {len(sublist)}, expected 1.")
+                            try:
+                                flat_scores.append(float(sublist[0]))
+                            except (ValueError, TypeError):
+                                raise ValueError(f"ZMQ server returned non-float score in sublist for eval sample {idx}: {sublist}")
+
+                        all_rewards_cpu = torch.tensor(flat_scores, dtype=torch.float)
+                        self.accelerator.print(f"Received {len(flat_scores)} rewards from ZMQ server.")
+
+                    except Exception as e:
+                        self.accelerator.print(f"Error communicating with ZMQ reward server during evaluation: {e}")
+                        all_rewards_cpu = None # Indicate failure
+                else:
+                    self.accelerator.print("No evaluation samples gathered, skipping reward calculation.")
+                    all_rewards_cpu = torch.tensor([], dtype=torch.float) # Empty tensor
+
+            # Broadcast the calculated rewards (or None/empty) to all processes
+            rewards_to_broadcast = [all_rewards_cpu]
+            if accelerator.num_processes > 1:
+                broadcast_object_list(rewards_to_broadcast, from_process=0)
+            all_rewards_cpu = rewards_to_broadcast[0]
+
+            # --- Log Metrics (on main process) ---
+            if accelerator.is_main_process:
+                if all_rewards_cpu is not None and all_rewards_cpu.numel() > 0:
+                    mean_reward = all_rewards_cpu.mean().item()
+                    std_reward = all_rewards_cpu.std().item() if all_rewards_cpu.numel() > 1 else 0.0
+                    metrics = {
+                        "eval/reward_mean": mean_reward,
+                        "eval/reward_std": std_reward,
+                        "eval/samples": all_rewards_cpu.numel()
+                    }
+                    self.accelerator.print(f"Evaluation Metrics: {metrics}")
+                    self.log(metrics) # Use self.log for automatic WandB integration
+
+                    # --- Optional: Log examples to WandB Table ---
+                    # Be careful: logging too many examples can slow things down.
+                    if is_wandb_available():
+                        try:
+                            accelerator.print("Logging evaluation examples to WandB table...")
+                            num_table_rows = len(all_prompts_gathered)
+                            eval_table = wandb.Table(columns=["global_step", "prompt", "completion", "reward"])
+                            for i in range(num_table_rows):
+                                eval_table.add_data(
+                                    global_step,
+                                    all_prompts_gathered[i],
+                                    all_completions_gathered[i],
+                                    all_rewards_cpu[i].item()
+                                )
+                            # Log the table with a descriptive name
+                            self.log({"eval/examples": eval_table})
+                            self.accelerator.print(f"Logged {num_table_rows} evaluation examples to WandB table.")
+                        except Exception as wb_err:
+                            self.accelerator.print(f"Warning: Failed to log WandB evaluation table: {wb_err}")
+
+                else:
+                    self.accelerator.print("No valid rewards calculated for evaluation metrics.")
+
+
+        except Exception as e:
+            self.accelerator.print(f"An error occurred during evaluation: {e}")
+            import traceback
+            self.accelerator.print(traceback.format_exc())
+
+        finally:
+            # --- Unload Adapter ---
+            if adapter_loaded and accelerator.is_main_process:
+                self.accelerator.print(f"Unloading adapter '{self.vllm_adapter_name}' after evaluation...")
+                unload_success = self._unload_adapter_via_api(self.vllm_adapter_name)
+                if not unload_success:
+                    self.accelerator.print(f"Warning: Failed to unload adapter '{self.vllm_adapter_name}' after evaluation.")
+
+            # Restore model to train mode
+            self.model.train()
+            # Ensure cleanup happens
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            eval_end_time = time.time()
+            self.accelerator.print(f"--- Finished Evaluation in {eval_end_time - eval_start_time:.2f}s ---")
+            accelerator.wait_for_everyone() # Sync at the end of evaluation
 
 
     def create_model_card(

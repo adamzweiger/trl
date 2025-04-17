@@ -52,16 +52,14 @@ class RLOOIndirectConfig(TrainingArguments):
             Whether to normalize the calculated advantages.
         token_level_kl (`bool`, *optional*, defaults to `False`):
             Whether to apply the KL penalty at the token level (inside the reward calculation) or at the sequence level (added to the loss).
-        reward_fn_path (`str`, *optional*, defaults to `None`):
-            Path to the Python file containing the reward function. This file must define a function named `reward_fn` with the signature `reward_fn(llm: vllm.LLM, prompt_text: str, completions_text: List[str], target: Any, **kwargs) -> List[float]`.
-            The function should return a list of k reward scores (floats, ideally between 0 and 1) corresponding to the k completions.
-            The `llm` object passed is typically the reference model used for KL computation, not the active policy model.
         reward_fn_kwargs (`Dict[str, Any]`, *optional*, defaults to `None`):
             Dictionary of keyword arguments to pass to the external reward function (`reward_fn`).
         num_ppo_epochs (`int`, *optional*, defaults to `1`):
             Number of optimization epochs per batch of generated data. Typically 1 for RLOO as new data is generated in each step.
         task_type (`str`, *optional*, defaults to `math`):
             Can be either `math`, `fewshot`, or `cpt`. This is used to determine the type of task for which the reward function is being defined.
+        cliprange (`float`, *optional*, defaults to `0.2`):
+            The clip range for the PPO loss. This is used to limit the policy update to a certain range.
 
         > Parameters specific to PEFT (LoRA)
 
@@ -75,6 +73,8 @@ class RLOOIndirectConfig(TrainingArguments):
             List of module names or regex patterns to apply LoRA to. If `None`, PEFT will attempt to automatically infer target modules based on the model architecture.
         lora_adapter_name (`str`, *optional*, defaults to `outer_lora`):
             The name of the LoRA adapter to load. If `None`, the default adapter name will be used. This is only relevant if you are loading a pretrained LoRA adapter.
+        eval_steps (`int`, *optional*, defaults to `None`):
+            Number of steps between two evaluations.
 
         > Parameters for vLLM Generation
 
@@ -99,7 +99,7 @@ class RLOOIndirectConfig(TrainingArguments):
         exp_name (`str`, *optional*, defaults to `rloo_indirect`):
             Name for the experiment (used for run naming).
         num_sample_generations (`int`, *optional*, defaults to `10`):
-             Number of times to generate sample completions during training for logging/evaluation. 0 to disable.
+            Number of times to generate sample completions during training for logging/evaluation. 0 to disable.
         missing_eos_penalty (`float`, *optional*, defaults to `None`):
             Penalty to apply to the score if the generated response does not contain the EOS token. If `None`, no penalty is applied.
         stop_token (`str`, *optional*, defaults to `"eos"`):
@@ -117,17 +117,17 @@ class RLOOIndirectConfig(TrainingArguments):
         gradient_accumulation_steps (`int`, *optional*, defaults to `1`):
             Number of updates steps to accumulate gradients for before performing a backward/update pass.
         learning_rate (`float`, *optional*, defaults to `1.41e-5`):
-             The initial learning rate for AdamW optimizer. RLOO typically uses smaller learning rates.
+            The initial learning rate for AdamW optimizer. RLOO typically uses smaller learning rates.
         num_train_epochs (`float`, *optional*, defaults to `3.0`):
             Total number of training epochs to perform.
         max_steps (`int`, *optional*, defaults to `-1`):
-             If set to a positive number, the total number of training steps to perform. Overrides `num_train_epochs`.
+            If set to a positive number, the total number of training steps to perform. Overrides `num_train_epochs`.
         logging_steps (`int` or `float`, *optional*, defaults to 10):
-             Number of update steps between two logs if `logging_strategy="steps"`. Can be a float < 1 to log every fraction of an epoch. Adjusted default for RL.
+            Number of update steps between two logs if `logging_strategy="steps"`. Can be a float < 1 to log every fraction of an epoch. Adjusted default for RL.
         save_steps (`int` or `float`, *optional*, defaults to 100):
             Number of updates steps before two checkpoint saves if `save_strategy="steps"`. Can be a float < 1 to save every fraction of an epoch. Adjusted default for RL.
         output_dir (`str`):
-             The output directory where the model predictions and checkpoints will be written.
+            The output directory where the model predictions and checkpoints will be written.
         seed (`int`, *optional*, defaults to `42`):
             Random seed that will be set at the beginning of training.
         remove_unused_columns (`bool`, *optional*, defaults to `False`):
@@ -172,12 +172,6 @@ class RLOOIndirectConfig(TrainingArguments):
         default=False,
         metadata={"help": "Apply KL penalty at token-level (in reward) or sequence-level (in loss)."},
     )
-    reward_fn_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Path to the Python file defining the `reward_fn(llm, prompt_text, completions_text, target, **kwargs)`."
-        },
-    )
     reward_fn_kwargs: Optional[Dict[str, Any]] = field(
         default_factory=dict, metadata={"help": "Keyword arguments to pass to the reward function `reward_fn`."}
     )
@@ -189,6 +183,9 @@ class RLOOIndirectConfig(TrainingArguments):
         metadata={
             "help": "Task type for the reward function. Can be 'math', 'fewshot', or 'cpt'."
         },
+    )
+    cliprange: float = field(
+        default=0.2, metadata={"help": "PPO clipping parameter."}
     )
 
     # --- PEFT Specifics ---
@@ -230,6 +227,10 @@ class RLOOIndirectConfig(TrainingArguments):
     vllm_adapter_name: str = field( # Changed Optional[str] to str and removed None default, as it's required
         default="dynamic_training_adapter",
         metadata={"help": "Required: The fixed name used when dynamically loading the adapter via the vLLM API."}
+    )
+
+    eval_steps: int = field(
+        default=100, metadata={"help": "Run evaluation every eval_steps steps. Set <= 0 to disable periodic eval."}
     )
 
     # --- Other Config ---
@@ -281,12 +282,6 @@ class RLOOIndirectConfig(TrainingArguments):
         # --- Validation Checks ---
         if self.rloo_k < 2:
             raise ValueError("rloo_k must be >= 2 for REINFORCE Leave-One-Out.")
-
-        if self.reward_fn_path is None:
-             raise ValueError("`reward_fn_path` must be provided and point to a valid Python file.")
-        if not os.path.isfile(self.reward_fn_path):
-            raise FileNotFoundError(f"Reward function file not found at path: {self.reward_fn_path}")
-
         if self.vllm_api_url is None:
             raise ValueError("`vllm_api_url` must be provided (URL of the vLLM API server).")
         if not self.adapter_save_dir: # Check if empty string, None should not happen due to typing/default
