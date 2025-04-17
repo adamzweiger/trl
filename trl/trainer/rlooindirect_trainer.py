@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import gc
+import re
 import math
 import os
 import zmq
@@ -87,9 +88,9 @@ DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
 
 # ZMQ placeholder (uncomment and configure when ready)
-# ZMQ_CONTEXT = zmq.Context()
-# ZMQ_SOCKET = ZMQ_CONTEXT.socket(zmq.REQ)
-# ZMQ_SOCKET.connect("tcp://localhost:5555") # Replace with your ZMQ server address
+ZMQ_CONTEXT = zmq.Context()
+ZMQ_SOCKET = ZMQ_CONTEXT.socket(zmq.REQ)
+ZMQ_SOCKET.connect("tcp://localhost:5555") # Replace with your ZMQ server address
 
 
 def log_on_all_ranks(accelerator, message):
@@ -350,8 +351,9 @@ class RLOOIndirectTrainer(Trainer):
 
         # --- Reward Function Loading / ZMQ ---
         self.reward_fn_kwargs = args.reward_fn_kwargs or {}
-        # self.zmq_context = ZMQ_CONTEXT # Use shared context/socket
-        # self.zmq_socket = ZMQ_SOCKET
+        if self.task_type == "cpt":
+            self.zmq_context = ZMQ_CONTEXT # Use shared context/socket
+            self.zmq_socket = ZMQ_SOCKET
 
         # --- vLLM API Client ---
         self.vllm_api_url = args.vllm_api_url
@@ -573,87 +575,97 @@ class RLOOIndirectTrainer(Trainer):
 
     def _call_zmq_reward_server(self, prompts, completions, task_type, task_data, kwargs, evaluate=False) -> List[List[float]]:
         """Sends data to ZMQ server and returns rewards."""
-        num_prompts = len(prompts)
-        k = len(completions[0]) if num_prompts > 0 and completions and completions[0] else self.args.rloo_k
-        if not self.accelerator.is_main_process:
-             return [[0.0] * k for _ in range(num_prompts)]
+        if task_type != "cpt":
+            num_prompts = len(prompts)
+            k = len(completions[0]) if num_prompts > 0 and completions and completions[0] else self.args.rloo_k
+            if not self.accelerator.is_main_process:
+                return [[0.0] * k for _ in range(num_prompts)]
 
-        # --- Dummy Reward Implementation ---
-        # Replace this with your actual ZMQ call when ready
-        log_on_all_ranks(self.accelerator, "[DUMMY REWARD] Calculating dummy rewards based on length...")
-        target_length = 1024.0 # Example target length
-        nested_scores = []
-        for i, comps_for_prompt in enumerate(completions):
-             scores_for_prompt = [] # Initialize list for THIS prompt's k scores
-             for j, comp_text in enumerate(comps_for_prompt):
-                  score = 0.0 # Default score
-                  if "ERROR: FAILED GENERATION" in comp_text:
-                      score = -10.0 # Penalize failed generations heavily
-                  else:
-                    try:
-                        comp_len = len(self.processing_class.encode(comp_text, add_special_tokens=False))
-                        score = max(0.0, 1.0 - (abs(comp_len - target_length) / target_length))
-                    except Exception as e:
-                         log_on_all_ranks(self.accelerator, f"Warning: Error encoding completion text during dummy reward calc: {e}")
-                         score = -5.0 # Penalize encoding errors less severely?
+            # --- Heads/Tails Reward Implementation ---
+            log_on_all_ranks(self.accelerator, "[REWARD] Calculating Heads/Tails rewards...")
+            nested_scores = []
 
-                  # Append the score for THIS specific completion (j)
-                  scores_for_prompt.append(score)
+            # Note: task_data is no longer used for scoring but kept for length check consistency
+            if len(task_data) != num_prompts:
+                log_on_all_ranks(self.accelerator, f"Error: Mismatch between prompts ({num_prompts}) and task_data ({len(task_data)}). Reward calculation skipped.")
+                # Return default scores matching expected shape
+                return [[0.0] * (k + 1 if evaluate else k) for _ in range(num_prompts)]
 
-             # After processing all k completions, append the list of k scores
-             if len(scores_for_prompt) != k:
-                  log_on_all_ranks(self.accelerator, f"Warning: Dummy reward generated {len(scores_for_prompt)} scores for prompt {i}, expected k={k}.")
-                  # Pad or truncate if necessary, though ideally should match k
-                  while len(scores_for_prompt) < k: scores_for_prompt.append(0.0) # Pad with 0
-                  scores_for_prompt = scores_for_prompt[:k] # Truncate
-             if evaluate:
+            # We don't need prompt_text or target_data for this specific reward,
+            # but iterate through them to maintain structure and indices.
+            for i, (_, comps_for_prompt, _) in enumerate(zip(prompts, completions, task_data)):
+                scores_for_prompt = []
+
+                # --- Calculate Scores for k Completions ---
+                for j, comp_text in enumerate(comps_for_prompt):
+                    score = 0.0 # Default score
+                    # extract whats in \boxed
+                    if "96" in comp_text:
+                        score = 1.0
+                    else:
+                        score = 0.0
+                    scores_for_prompt.append(score)
+
+                # --- Pad/Truncate to k and Handle Evaluate Flag ---
+                # Ensure the list has exactly k elements before potentially adding evaluate score
+                current_len = len(scores_for_prompt)
+                if current_len != k:
+                    # Only log if k was expected (i.e., num_prompts > 0 and completions existed)
+                    if k > 0 :
+                        log_on_all_ranks(self.accelerator, f"Warn: Prompt {i} generated {current_len} scores, expected k={k}. Padding/truncating.")
+                    scores_for_prompt.extend([0.0] * max(0, k - current_len)) # Pad if too short
+                    scores_for_prompt = scores_for_prompt[:k]                # Truncate if too long
+
+                if evaluate:
                     scores_for_prompt.append(0.0) # Append dummy score for evaluation
 
-             nested_scores.append(scores_for_prompt) # Append the list [score_0, score_1, ..., score_k-1]
+                nested_scores.append(scores_for_prompt)
 
-        log_on_all_ranks(self.accelerator, f"[DUMMY REWARD] Finished calculating {len(nested_scores)} dummy reward lists, each expected length {k}.")
-        return nested_scores
-        # --- End Dummy Reward Implementation ---
+            final_k = k + 1 if evaluate else k
+            log_on_all_ranks(self.accelerator, f"[REWARD] Finished calculating {len(nested_scores)} reward lists, each expected length {final_k}.")
+            return nested_scores
+        # --- End Heads/Tails Reward Implementation ---
 
         # --- ZMQ Implementation (Uncomment and adapt) ---
-        # log_on_all_ranks(self.accelerator, f"Sending {len(prompts)} prompts to ZMQ reward server...")
-        # try:
-        #     message = {
-        #         "prompt_texts": prompts,
-        #         "completions_texts": completions,
-        #         "task_type": task_type,
-        #         "task_specific_data": task_data,
-        #         "trainer_info": {"class": str(self.__class__.__name__), "rank": self.accelerator.process_index}, # Example info
-        #         **kwargs
-        #     }
-        #     # Ensure JSON serializability
-        #     # Might need to convert complex objects (like dicts in task_data for CPT) if necessary
-        #     serializable_message = json.loads(json.dumps(message))
+        log_on_all_ranks(self.accelerator, f"Sending {len(prompts)} prompts to ZMQ reward server...")
+        try:
+            message = {
+                "prompt_texts": prompts,
+                "completions_texts": completions,
+                "task_type": task_type,
+                "task_specific_data": task_data,
+                "evaluate": evaluate,
+                "trainer_info": {"class": str(self.__class__.__name__), "rank": self.accelerator.process_index}, # Example info
+                **kwargs
+            }
+            # Ensure JSON serializability
+            # Might need to convert complex objects (like dicts in task_data for CPT) if necessary
+            serializable_message = json.loads(json.dumps(message))
 
-        #     self.zmq_socket.send_json(serializable_message)
-        #     response = self.zmq_socket.recv_json()
-        #     log_on_all_ranks(self.accelerator, "Received response from ZMQ reward server.")
+            self.zmq_socket.send_json(serializable_message)
+            response = self.zmq_socket.recv_json()
+            log_on_all_ranks(self.accelerator, "Received response from ZMQ reward server.")
 
-        #     nested_scores_list = response.get("rewards", None)
+            nested_scores_list = response.get("rewards", None)
 
-        #     # Validation
-        #     if not isinstance(nested_scores_list, list) or len(nested_scores_list) != len(prompts):
-        #         raise ValueError(f"ZMQ reward function returned invalid data. Expected list of {len(prompts)} lists. Got: {type(nested_scores_list)} len {len(nested_scores_list)}")
-        #     for i, sublist in enumerate(nested_scores_list):
-        #          k = len(completions[i])
-        #          if not isinstance(sublist, list) or len(sublist) != k:
-        #               raise ValueError(f"ZMQ reward sublist for prompt {i} invalid. Expected list of {k} floats. Got: {type(sublist)} len {len(sublist)}")
-        #          # Optional: Check if values are floats? Handled by ZMQ server ideally.
+            # Validation
+            if not isinstance(nested_scores_list, list) or len(nested_scores_list) != len(prompts):
+                raise ValueError(f"ZMQ reward function returned invalid data. Expected list of {len(prompts)} lists. Got: {type(nested_scores_list)} len {len(nested_scores_list)}")
+            for i, sublist in enumerate(nested_scores_list):
+                 k = len(completions[i])
+                 if not isinstance(sublist, list) or len(sublist) != k:
+                      raise ValueError(f"ZMQ reward sublist for prompt {i} invalid. Expected list of {k} floats. Got: {type(sublist)} len {len(sublist)}")
+                 # Optional: Check if values are floats? Handled by ZMQ server ideally.
 
-        #     return nested_scores_list
+            return nested_scores_list
 
-        # except zmq.ZMQError as e:
-        #     log_on_all_ranks(self.accelerator, f"ZMQ Error communicating with reward server: {e}")
-        #     # Handle error appropriately - maybe return default low scores or raise
-        #     raise RuntimeError(f"Failed to get rewards from ZMQ server: {e}") from e
-        # except Exception as e:
-        #     log_on_all_ranks(self.accelerator, f"Error processing ZMQ reward request/response: {e}")
-        #     raise RuntimeError(f"Failed during ZMQ communication: {e}") from e
+        except zmq.ZMQError as e:
+            log_on_all_ranks(self.accelerator, f"ZMQ Error communicating with reward server: {e}")
+            # Handle error appropriately - maybe return default low scores or raise
+            raise RuntimeError(f"Failed to get rewards from ZMQ server: {e}") from e
+        except Exception as e:
+            log_on_all_ranks(self.accelerator, f"Error processing ZMQ reward request/response: {e}")
+            raise RuntimeError(f"Failed during ZMQ communication: {e}") from e
         # --- End ZMQ Implementation ---
 
 
@@ -662,7 +674,6 @@ class RLOOIndirectTrainer(Trainer):
         args = self.args
         accelerator = self.accelerator
         device = accelerator.device
-        optimizer = self.optimizer
         model = self.model # This is the wrapped model
 
         log_on_all_ranks(accelerator, "=== Starting Training (PPO-Style RLOO PEFT Adapter with vLLM) ===")
@@ -1793,7 +1804,11 @@ class RLOOIndirectTrainer(Trainer):
                         log_on_all_ranks(accelerator, "Logging evaluation examples to WandB table...")
                         max_table_rows = 50 # Limit number of rows
                         num_table_rows = min(len(all_prompts_gathered), max_table_rows)
-                        eval_table = wandb.Table(columns=["global_step", "prompt", "completion", "reward", "baseline_reward"])
+                        if not hasattr(self, "_eval_examples_table"):
+                            self._eval_examples_table = wandb.Table(
+                                columns=["global_step", "prompt", "completion", "reward", "baseline_reward"]
+                            )
+                        eval_table = self._eval_examples_table
                         indices_to_log = torch.randperm(len(all_prompts_gathered))[:num_table_rows] # Log random samples
 
                         for i in indices_to_log:

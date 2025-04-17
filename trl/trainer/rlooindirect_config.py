@@ -42,6 +42,8 @@ class RLOOIndirectConfig(TrainingArguments):
         kl_coef (`float`, *optional*, defaults to `0.05`):
             Coefficient for the KL divergence penalty between the policy and the reference policy (base model).
             Applied sequence-wise before advantage calculation in this implementation.
+        cliprange (`float`, *optional*, defaults to `0.2`):
+            Clip range.
         rloo_k (`int`, *optional*, defaults to `2`):
             Number of online samples (generations) per prompt for REINFORCE Leave-One-Out (RLOO). Must be >= 2.
         num_ppo_epochs (`int`, *optional*, defaults to `4`):
@@ -152,6 +154,10 @@ class RLOOIndirectConfig(TrainingArguments):
     # --- RLOO & PPO Specifics ---
     kl_coef: float = field(
         default=0.05, metadata={"help": "Coefficient for the KL divergence penalty (applied sequence-wise)."}
+    )
+    cliprange: float = field(
+        default=0.2,
+        metadata={"help": "Clip range."},
     )
     rloo_k: int = field(
         default=2,
