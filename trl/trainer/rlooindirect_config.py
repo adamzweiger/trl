@@ -14,52 +14,61 @@
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 from transformers import TrainingArguments
+from transformers.trainer_utils import IntervalStrategy, SchedulerType, HubStrategy # Import necessary enums/types
 
 
 @dataclass
 class RLOOIndirectConfig(TrainingArguments):
     r"""
-    Configuration class for the [`RLOOIndirectTrainer`].
+    Configuration class for the PPO-style [`RLOOIndirectTrainer`].
 
     This class inherits from [`~transformers.TrainingArguments`] and includes specific parameters for
-    RLOO (REINFORCE Leave-One-Out) training using vLLM for generation with PEFT adapters and an indirect
-    reward function specified via a Python file path.
+    RLOO (REINFORCE Leave-One-Out) training using a PPO-like optimization loop, vLLM for generation
+    with PEFT adapters, and an indirect reward function (e.g., via ZMQ or external script).
 
     Parameters:
         model_name_or_path (`str`, *optional*, defaults to `None`):
-            Path to pretrained model or model identifier from huggingface.co/models.
+            Path to pretrained model or model identifier from huggingface.co/models. Used for loading the base model.
         trust_remote_code (`bool`, *optional*, defaults to `False`):
-            Whether to allow for custom models defined on the Hub in their own modeling files. This option should only
-            be set to `True` for repositories you trust and in which you have read the code, as it will execute code
-            present on the Hub on your local machine.
+            Whether to allow custom models defined on the Hub. Use with caution.
         torch_dtype (`str`, *optional*, defaults to `None`):
-            Override the default `torch.dtype` and load the model with another dtype. If 'auto', the dtype will be automatically derived from the model's weights.
+            Override the default `torch.dtype` and load the model with another dtype ('auto' for automatic).
 
-        > Parameters specific to RLOO Indirect training
+        > Parameters specific to RLOO & PPO-Style Training
 
         kl_coef (`float`, *optional*, defaults to `0.05`):
-            Coefficient for the KL divergence penalty between the policy and the reference policy.
+            Coefficient for the KL divergence penalty between the policy and the reference policy (base model).
+            Applied sequence-wise before advantage calculation in this implementation.
         rloo_k (`int`, *optional*, defaults to `2`):
             Number of online samples (generations) per prompt for REINFORCE Leave-One-Out (RLOO). Must be >= 2.
+        num_ppo_epochs (`int`, *optional*, defaults to `4`):
+            Number of optimization epochs to perform on the generated batch of data during the PPO optimization phase.
+        num_mini_batches (`int`, *optional*, defaults to `1`):
+            Number of mini-batches to split the full rollout batch into during the PPO optimization phase.
+            `batch_size` must be divisible by `num_mini_batches * world_size`.
+        batch_size (`int`, *optional*, defaults to `None`):
+            Number of prompts processed in one full RLOO rollout *across all devices*. If `None`, it will be calculated
+            as `per_device_train_batch_size * gradient_accumulation_steps * num_mini_batches * world_size`
+            in the trainer initialization. This defines the size of the experience buffer generated before the PPO phase.
+        total_episodes (`int`, *optional*, defaults to `None`):
+            Total number of prompt-generation episodes to train on. If `None`, it's derived from `num_train_epochs`
+            and the dataset size. This determines the total amount of generated data. `num_total_batches` (rollouts)
+            is derived from `total_episodes / batch_size`.
         normalize_reward (`bool`, *optional*, defaults to `False`):
-            Whether to normalize the rewards obtained from the reward function before calculating advantages.
+            Whether to normalize the rewards obtained from the reward function using running mean and std deviation *before* advantage calculation.
         reward_clip_range (`float`, *optional*, defaults to `10.0`):
-            The range to clip rewards to if `normalize_reward` is `True`. Rewards are clipped to `[-reward_clip_range, reward_clip_range]`.
-        normalize_advantage (`bool`, *optional*, defaults to `False`):
-            Whether to normalize the calculated advantages.
-        token_level_kl (`bool`, *optional*, defaults to `False`):
-            Whether to apply the KL penalty at the token level (inside the reward calculation) or at the sequence level (added to the loss).
-        reward_fn_kwargs (`Dict[str, Any]`, *optional*, defaults to `None`):
-            Dictionary of keyword arguments to pass to the external reward function (`reward_fn`).
-        num_ppo_epochs (`int`, *optional*, defaults to `1`):
-            Number of optimization epochs per batch of generated data. Typically 1 for RLOO as new data is generated in each step.
+            The range to clip rewards to *if* `normalize_reward` is `True`. Rewards are clipped to `[-reward_clip_range, reward_clip_range]`.
+        normalize_advantage (`bool`, *optional*, defaults to `True`):
+            Whether to normalize the calculated advantages using running mean and std deviation. Recommended for PPO stability.
         task_type (`str`, *optional*, defaults to `math`):
-            Can be either `math`, `fewshot`, or `cpt`. This is used to determine the type of task for which the reward function is being defined.
-        cliprange (`float`, *optional*, defaults to `0.2`):
-            The clip range for the PPO loss. This is used to limit the policy update to a certain range.
+            Task type identifier ('math', 'fewshot', 'cpt') passed to the reward function.
+        reward_fn_kwargs (`Dict[str, Any]`, *optional*, defaults to `{}`):
+            Dictionary of keyword arguments to pass to the external reward function (e.g., via ZMQ context).
+        missing_eos_penalty (`float`, *optional*, defaults to `None`):
+            Penalty to apply to the reward score if the generated response does not contain the EOS token. If `None`, no penalty is applied.
 
         > Parameters specific to PEFT (LoRA)
 
@@ -69,69 +78,63 @@ class RLOOIndirectConfig(TrainingArguments):
             The alpha parameter for LoRA scaling (`scaling = lora_alpha / lora_rank`).
         lora_dropout (`float`, *optional*, defaults to `0.1`):
             The dropout probability for LoRA layers.
-        lora_target_modules (`List[str]`, *optional*, defaults to `None`):
-            List of module names or regex patterns to apply LoRA to. If `None`, PEFT will attempt to automatically infer target modules based on the model architecture.
-        lora_adapter_name (`str`, *optional*, defaults to `outer_lora`):
-            The name of the LoRA adapter to load. If `None`, the default adapter name will be used. This is only relevant if you are loading a pretrained LoRA adapter.
-        eval_steps (`int`, *optional*, defaults to `None`):
-            Number of steps between two evaluations.
+        lora_adapter_name (`str`, *optional*, defaults to `"rloo_adapter"`):
+            The name to use for the LoRA adapter being trained and saved/loaded by the trainer and vLLM.
 
         > Parameters for vLLM Generation
 
-        max_completion_length (`int`, *optional*, defaults to `256`):
-            Maximum number of new tokens to generate for completions.
+        max_response_length (`int`, *optional*, defaults to `256`):
+            Maximum number of *new* tokens to generate for completions during the rollout phase.
         temperature (`float`, *optional*, defaults to `0.7`):
-            Sampling temperature for generation. Higher values make the output more random. Lower values make it more deterministic.
+            Sampling temperature for generation. Higher values make the output more random.
         top_p (`float`, *optional*, defaults to `1.0`):
             If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or higher are kept for generation.
+        stop_token (`str`, *optional*, defaults to `"eos"`):
+            If set to "eos", use the tokenizer's EOS token ID as the stop sequence for vLLM generation. Otherwise, this argument is ignored for the stop ID.
+        stop_token_id (`int`, *optional*, defaults to `None`):
+            Explicit token ID to use for truncating responses *after* generation. Overrides `stop_token` behavior for truncation if set.
 
         > Parameters for vLLM API Interaction
 
-        vllm_api_url (`str`, *optional*, defaults to `None`):
-            URL of the running vLLM OpenAI API server (e.g., http://localhost:8000). This is required for vLLM generation.
+        vllm_api_url (`str`):
+            **Required.** URL of the running vLLM OpenAI API compatible server (e.g., `http://localhost:8000`).
         adapter_save_dir (`str`, *optional*, defaults to `"./adapter_checkpoints"`):
-            Directory to save temporary adapters for vLLM requests. This directory will be created if it does not exist.
+            Directory to save temporary adapters between training steps for vLLM to load. Will be created if it doesn't exist.
         vllm_adapter_name (`str`, *optional*, defaults to `"dynamic_training_adapter"`):
-            The fixed name used when dynamically loading the adapter via the vLLM API. This is required for vLLM generation.
+            The fixed name used when dynamically loading/unloading the adapter via the vLLM API. Should match the LoRA adapter name used internally unless there's a specific reason.
 
         > Other Parameters
 
-        exp_name (`str`, *optional*, defaults to `rloo_indirect`):
-            Name for the experiment (used for run naming).
-        num_sample_generations (`int`, *optional*, defaults to `10`):
-            Number of times to generate sample completions during training for logging/evaluation. 0 to disable.
-        missing_eos_penalty (`float`, *optional*, defaults to `None`):
-            Penalty to apply to the score if the generated response does not contain the EOS token. If `None`, no penalty is applied.
-        stop_token (`str`, *optional*, defaults to `"eos"`):
-            If set to "eos", use the tokenizer's EOS token ID as the stop token for response truncation. Otherwise, this argument is ignored.
-        stop_token_id (`int`, *optional*, defaults to `None`):
-            Explicit token ID to use for truncating responses. Overrides `stop_token` if set.
+        exp_name (`str`, *optional*, defaults to `rloo_indirect_ppo`):
+            Name for the experiment (used for run naming and potentially logging).
         log_policy_entropy (`bool`, *optional*, defaults to `True`):
-            Whether to log the policy entropy during training.
+            Whether to compute and log the policy entropy during the PPO optimization phase.
 
-
-        > Parameters inherited from TrainingArguments (relevant ones mentioned)
+        > Parameters inherited from TrainingArguments (Key overrides and notes)
 
         per_device_train_batch_size (`int`, *optional*, defaults to `8`):
-            Batch size (number of prompts) per GPU/TPU core/CPU for training. The RLOO trainer will generate `rloo_k` completions for each prompt.
+            Number of prompts processed per device *per gradient accumulation step* during the PPO optimization phase.
+            This is the **micro-batch size** for the inner PPO loop.
         gradient_accumulation_steps (`int`, *optional*, defaults to `1`):
-            Number of updates steps to accumulate gradients for before performing a backward/update pass.
-        learning_rate (`float`, *optional*, defaults to `1.41e-5`):
-            The initial learning rate for AdamW optimizer. RLOO typically uses smaller learning rates.
-        num_train_epochs (`float`, *optional*, defaults to `3.0`):
-            Total number of training epochs to perform.
+            Number of micro-batch steps to accumulate gradients for before performing a backward/update pass during the PPO optimization phase.
+        learning_rate (`float`, *optional*, defaults to `1e-5`):
+            The initial learning rate for AdamW optimizer. RL often requires smaller LRs.
+        num_train_epochs (`float`, *optional*, defaults to `1.0`):
+            Total number of training epochs to perform, defined in terms of passing over the dataset *to generate prompts*. Used to calculate `total_episodes` if not set directly.
         max_steps (`int`, *optional*, defaults to `-1`):
-            If set to a positive number, the total number of training steps to perform. Overrides `num_train_epochs`.
-        logging_steps (`int` or `float`, *optional*, defaults to 10):
-            Number of update steps between two logs if `logging_strategy="steps"`. Can be a float < 1 to log every fraction of an epoch. Adjusted default for RL.
-        save_steps (`int` or `float`, *optional*, defaults to 100):
-            Number of updates steps before two checkpoint saves if `save_strategy="steps"`. Can be a float < 1 to save every fraction of an epoch. Adjusted default for RL.
+            If set to a positive number, the total number of **PPO optimization steps** to perform (i.e., `global_step` in the PPO phase). Overrides `num_train_epochs`/`total_episodes`.
+        logging_steps (`float`, *optional*, defaults to `10`):
+            Log every X **PPO optimization steps**. Can be < 1 to log fractionally based on `max_steps`.
+        save_steps (`float`, *optional*, defaults to `100`):
+            Save checkpoint every X **PPO optimization steps**. Can be < 1 to save fractionally based on `max_steps`.
+        eval_steps (`float`, *optional*, defaults to `100`):
+            Run evaluation every X **PPO optimization steps**. Can be < 1 to evaluate fractionally based on `max_steps`. Set <= 0 to disable periodic eval.
         output_dir (`str`):
-            The output directory where the model predictions and checkpoints will be written.
+            **Required.** The output directory where the model adapters and checkpoints will be written.
         seed (`int`, *optional*, defaults to `42`):
-            Random seed that will be set at the beginning of training.
+            Random seed for reproducibility.
         remove_unused_columns (`bool`, *optional*, defaults to `False`):
-            Whether to remove columns not required by the model's forward pass. It's recommended to set this to `False` for RL training, as extra columns (like 'target' or other metadata) might be needed by the reward function or for logging. Ensure your dataset includes at least a 'prompt' column.
+            **Recommended: `False`**. Whether to remove columns not required by the model's forward pass. RL often needs extra columns ('prompt', 'target', metadata) for rollouts and rewards.
     """
 
     # --- Model & Tokenizer ---
@@ -143,175 +146,174 @@ class RLOOIndirectConfig(TrainingArguments):
     )
     torch_dtype: Optional[str] = field(
         default=None,
-        metadata={
-            "help": (
-                "Override the default `torch.dtype` and load the model under this dtype. If 'auto' is passed, the "
-                "dtype will be automatically derived from the model's weights."
-            )
-        },
+        metadata={"help": "Override default model dtype ('auto' derived from weights)."}
     )
 
-    # --- RLOO Specifics ---
+    # --- RLOO & PPO Specifics ---
     kl_coef: float = field(
-        default=0.05, metadata={"help": "Coefficient for the KL divergence penalty."}
+        default=0.05, metadata={"help": "Coefficient for the KL divergence penalty (applied sequence-wise)."}
     )
     rloo_k: int = field(
         default=2,
-        metadata={"help": "REINFORCE Leave-One-Out (RLOO) number of online samples per prompt (must be >= 2)."},
+        metadata={"help": "RLOO number of online samples per prompt (must be >= 2)."},
+    )
+    num_ppo_epochs: int = field(
+        default=4, metadata={"help": "Number of optimization epochs per rollout batch in PPO phase."}
+    )
+    num_mini_batches: int = field(
+        default=1, metadata={"help": "Number of mini-batches to split rollout batch into for PPO updates."}
+    )
+    batch_size: Optional[int] = field(
+        default=None, metadata={"help": "Total prompts per rollout across all devices. Calculated if None."}
+    )
+    total_episodes: Optional[int] = field(
+        default=None, metadata={"help": "Total prompt-generation episodes to train on. Derived from num_train_epochs if None."}
     )
     normalize_reward: bool = field(
-        default=False, metadata={"help": "Whether to normalize rewards before advantage calculation."}
+        default=False, metadata={"help": "Normalize rewards before advantage calculation."}
     )
     reward_clip_range: float = field(
         default=10.0, metadata={"help": "Clip range for normalized rewards ([-X, X])."}
     )
     normalize_advantage: bool = field(
-        default=False, metadata={"help": "Whether to normalize calculated advantages."}
-    )
-    token_level_kl: bool = field(
-        default=False,
-        metadata={"help": "Apply KL penalty at token-level (in reward) or sequence-level (in loss)."},
-    )
-    reward_fn_kwargs: Optional[Dict[str, Any]] = field(
-        default_factory=dict, metadata={"help": "Keyword arguments to pass to the reward function `reward_fn`."}
-    )
-    num_ppo_epochs: int = field(
-        default=1, metadata={"help": "Number of optimization epochs per batch of generated data (usually 1 for RLOO)."}
+        default=True, metadata={"help": "Normalize calculated advantages."} # Default True for PPO
     )
     task_type: str = field(
-        default="math",
-        metadata={
-            "help": "Task type for the reward function. Can be 'math', 'fewshot', or 'cpt'."
-        },
+        default="math", metadata={"help": "Task type ('math', 'fewshot', 'cpt') passed to reward function."}
     )
-    cliprange: float = field(
-        default=0.2, metadata={"help": "PPO clipping parameter."}
+    reward_fn_kwargs: Dict[str, Any] = field( # Use dict directly as default_factory is implied for mutable types
+        default_factory=dict, metadata={"help": "Keyword arguments for the reward function."}
+    )
+    missing_eos_penalty: Optional[float] = field(
+        default=None, metadata={"help": "Penalty if EOS token is missing. None to disable."}
     )
 
     # --- PEFT Specifics ---
     lora_rank: int = field(
-        default=8, metadata={"help": "LoRA rank (dimension of the update matrices)."}
+        default=8, metadata={"help": "LoRA rank."}
     )
     lora_alpha: int = field(
-        default=16, metadata={"help": "LoRA alpha scaling factor."}
+        default=16, metadata={"help": "LoRA alpha scaling."}
     )
     lora_dropout: float = field(
-        default=0.1, metadata={"help": "Dropout probability for LoRA layers."}
-    )
-    lora_target_modules: Optional[List[str]] = field(
-        default=None, metadata={"help": "List of module names or regex patterns to apply LoRA to (e.g., ['q_proj', 'v_proj']). If None, PEFT auto-infers."}
+        default=0.1, metadata={"help": "LoRA dropout."}
     )
     lora_adapter_name: str = field(
-        default="outer_lora",
-        metadata={"help": "The name to use for the LoRA adapter being trained and saved/loaded."}
+        default="rloo_adapter",
+        metadata={"help": "Name for the trained LoRA adapter."}
     )
 
     # --- Generation Specifics (vLLM) ---
-    max_completion_length: int = field(
-        default=256, metadata={"help": "Maximum number of new tokens to generate per completion."}
+    max_response_length: int = field( # Renamed from max_completion_length
+        default=256, metadata={"help": "Maximum number of NEW tokens to generate during rollouts."}
     )
     temperature: float = field(
-        default=0.7, metadata={"help": "Sampling temperature for generation (higher means more random)."}
+        default=0.7, metadata={"help": "Sampling temperature for generation."}
     )
     top_p: float = field(
-        default=1.0, metadata={"help": "Nucleus sampling threshold (float < 1.0 to enable)."}
+        default=1.0, metadata={"help": "Nucleus sampling (p) threshold."}
+    )
+    stop_token: str = field(
+        default="eos", metadata={"help": "If 'eos', use tokenizer's EOS token ID as stop sequence for vLLM. Ignored otherwise."}
+    )
+    stop_token_id: Optional[int] = field(
+        default=None, metadata={"help": "Explicit stop token ID for post-generation truncation."}
     )
 
     # --- vLLM API Interaction ---
-    vllm_api_url: Optional[str] = field(
-        default=None, metadata={"help": "Required: URL of the running vLLM OpenAI API server (e.g., http://localhost:8000)."}
+    # Make required fields non-optional in the signature
+    vllm_api_url: str = field(
+        default=None,
+        metadata={"help": "Required: URL of the running vLLM OpenAI API server (e.g., http://localhost:8000)."}
     )
-    adapter_save_dir: str = field( # Changed Optional[str] to str and removed None default, as it's required
-        default="./adapter_checkpoints", metadata={"help": "Required: Directory to save temporary adapters for vLLM requests."}
+    adapter_save_dir: str = field(
+        default="./adapter_checkpoints", metadata={"help": "Directory to save temporary adapters for vLLM."}
     )
-    vllm_adapter_name: str = field( # Changed Optional[str] to str and removed None default, as it's required
+    vllm_adapter_name: str = field(
         default="dynamic_training_adapter",
-        metadata={"help": "Required: The fixed name used when dynamically loading the adapter via the vLLM API."}
-    )
-
-    eval_steps: int = field(
-        default=100, metadata={"help": "Run evaluation every eval_steps steps. Set <= 0 to disable periodic eval."}
+        metadata={"help": "Fixed name for dynamically loading/unloading adapter via vLLM API."}
     )
 
     # --- Other Config ---
     exp_name: str = field(
-        default="rloo_indirect", metadata={"help": "Experiment name for logging/wandb."}
-    )
-    num_sample_generations: int = field(
-        default=10, metadata={"help": "Number of sample generation rounds during training (logged). Set 0 to disable."}
-    )
-    missing_eos_penalty: Optional[float] = field(
-        default=None, metadata={"help": "Penalty subtracted from reward if EOS token is missing in generation. None to disable."}
-    )
-    stop_token: str = field(
-        default="eos", metadata={"help": "If 'eos', use tokenizer's EOS token ID as stop sequence. Otherwise ignored."}
-    )
-    stop_token_id: Optional[int] = field(
-        default=None, metadata={"help": "Explicit stop token ID (overrides stop_token='eos')."}
+        default="rloo_indirect_ppo", metadata={"help": "Experiment name for logging."}
     )
     log_policy_entropy: bool = field(
-        default=True, metadata={"help": "Whether to compute and log the policy entropy during training."}
+        default=True, metadata={"help": "Compute and log policy entropy during PPO."}
     )
-
 
     # --- Inherited/Overridden TrainingArguments ---
-    # Sensible defaults for RL, can be overridden by user
-    learning_rate: float = field(
-        default=1.41e-5, metadata={"help": "The initial learning rate for AdamW optimizer."}
+    output_dir: str = field(
+        default=None,
+        metadata={"help": "Required: Output directory for checkpoints and adapters."}
     )
     per_device_train_batch_size: int = field(
-        default=8, metadata={"help": "Batch size (number of prompts) per GPU/TPU core/CPU for training."}
+        default=8, metadata={"help": "Micro-batch size per device during PPO optimization."}
+    )
+    gradient_accumulation_steps: int = field(
+        default=1, metadata={"help": "Steps to accumulate gradients during PPO before optimizer step."}
+    )
+    learning_rate: float = field(
+        default=1e-5, metadata={"help": "Initial learning rate for AdamW."} # Adjusted default
+    )
+    num_train_epochs: float = field(
+        default=1.0, metadata={"help": "Epochs defined by passing over the dataset for prompt generation."} # Adjusted default
+    )
+    max_steps: int = field(
+        default=-1, metadata={"help": "Total number of PPO optimization steps. Overrides num_train_epochs/total_episodes."}
+    )
+    logging_steps: float = field(
+         default=10, metadata={"help": "Log every X PPO optimization steps."}
+    )
+    save_steps: float = field(
+        default=100, metadata={"help": "Save checkpoint every X PPO optimization steps."}
+    )
+    eval_steps: float = field(
+        default=100, metadata={"help": "Evaluate every X PPO optimization steps."}
     )
     remove_unused_columns: bool = field(
-        default=False, metadata={"help": "Set to False for RL. Keeps extra columns (e.g. 'target') needed by reward function."}
+        default=False, metadata={"help": "Recommended False: Keep extra columns for RL rollouts/rewards."}
     )
-    logging_steps: float = field( # Use float for fraction support
-         default=10, metadata={"help": "Log every X updates steps (can be < 1 for logging every fraction of an epoch)."}
-    )
-    save_steps: float = field( # Use float for fraction support
-        default=100, metadata={"help": "Save checkpoint every X updates steps (can be < 1 for saving every fraction of an epoch)."}
+    seed: int = field(
+        default=42, metadata={"help": "Random seed."}
     )
 
-
-    # Internal state variable, not meant to be set by user
-    local_dataloader_batch_size: int = field(init=False)
 
     def __post_init__(self):
-        super().__post_init__() # Call parent's post_init
+        # Perform validation checks after initializing TrainingArguments
+        if not hasattr(self, "output_dir") or self.output_dir is None:
+             raise ValueError("`output_dir` must be specified.")
+        if not hasattr(self, "vllm_api_url") or self.vllm_api_url is None:
+             raise ValueError("`vllm_api_url` must be specified.")
 
-        # --- Validation Checks ---
+        # Call parent's post_init AFTER checking required fields inherited/overridden
+        super().__post_init__()
+
         if self.rloo_k < 2:
-            raise ValueError("rloo_k must be >= 2 for REINFORCE Leave-One-Out.")
-        if self.vllm_api_url is None:
-            raise ValueError("`vllm_api_url` must be provided (URL of the vLLM API server).")
-        if not self.adapter_save_dir: # Check if empty string, None should not happen due to typing/default
-             raise ValueError("`adapter_save_dir` must be provided.")
-        if not self.vllm_adapter_name: # Check if empty string, None should not happen due to typing/default
-             raise ValueError("`vllm_adapter_name` must be provided.")
+            raise ValueError("`rloo_k` must be >= 2 for REINFORCE Leave-One-Out.")
+        if self.num_mini_batches <= 0:
+            raise ValueError("`num_mini_batches` must be positive.")
 
-
-        # Ensure adapter save directory exists
+        # Ensure adapter save directory exists (do this only on main process potentially?)
+        # It's generally safe to call makedirs everywhere, it handles existing dirs.
         os.makedirs(self.adapter_save_dir, exist_ok=True)
 
-        # Determine the batch size for the dataloader.
-        # In RLOO, the dataloader yields prompts. The trainer then generates k samples per prompt.
-        # So, the dataloader batch size should just be the number of prompts per device.
-        self.local_dataloader_batch_size = self.per_device_train_batch_size
-        print(
-            f"RLOO Config: Using `per_device_train_batch_size` ({self.per_device_train_batch_size}) "
-            f"as the number of prompts per device for data loading. "
-            f"The trainer will generate `rloo_k` ({self.rloo_k}) completions for each prompt."
-        )
-
+        # Warnings and informational messages
         if self.remove_unused_columns:
             print(
-                "Warning: `remove_unused_columns` is set to `True`. For RL training, it's often necessary to keep "
-                "extra columns (like 'target' or metadata) for the reward function. Set to `False` if you encounter issues."
+                "Warning: `remove_unused_columns` is True. Set to False if reward function needs extra dataset columns."
             )
-
-        if self.token_level_kl and self.kl_coef == 0.0:
-             print("Warning: `token_level_kl` is True, but `kl_coef` is 0.0. No KL penalty will be applied.")
-        if not self.token_level_kl and self.kl_coef > 0.0:
+        if self.kl_coef == 0.0:
+             print("Info: `kl_coef` is 0.0. No KL penalty will be applied during training.")
+        else:
              print(f"Info: Sequence-level KL penalty will be applied with `kl_coef`={self.kl_coef}.")
-        elif self.token_level_kl and self.kl_coef > 0.0:
-             print(f"Info: Token-level KL penalty will be applied with `kl_coef`={self.kl_coef}.")
+
+        if self.batch_size is not None and self.batch_size <= 0:
+             raise ValueError("If specified, `batch_size` (prompts per rollout) must be positive.")
+        if self.total_episodes is not None and self.total_episodes <= 0:
+             raise ValueError("If specified, `total_episodes` must be positive.")
+
+        # Convert steps from float to int if they are >= 1
+        if self.logging_steps >= 1: self.logging_steps = int(self.logging_steps)
+        if self.save_steps >= 1: self.save_steps = int(self.save_steps)
+        if self.eval_steps >= 1: self.eval_steps = int(self.eval_steps)
