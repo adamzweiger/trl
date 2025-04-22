@@ -41,7 +41,7 @@ from ..import_utils import is_mergekit_available
 from ..mergekit_utils import MergeConfig, merge_models, upload_model_to_hf
 from ..models.utils import unwrap_model_for_generation
 from .judges import BasePairwiseJudge
-from .utils import log_table_to_comet_experiment
+#from .utils import log_table_to_comet_experiment
 
 
 if is_deepspeed_available():
@@ -339,18 +339,6 @@ class WinRateCallback(TrainerCallback):
                     )
                     wandb.log({"win_rate_completions": wandb.Table(dataframe=df)})
 
-            if "comet_ml" in args.report_to:
-                df = _win_rate_completions_df(
-                    state=state,
-                    prompts=prompts,
-                    completions=completions,
-                    winner_indices=winner_indices,
-                )
-                log_table_to_comet_experiment(
-                    name="win_rate_completions.csv",
-                    table=df,
-                )
-
     def on_evaluate(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         # At every evaluation step, we generate completions for the model and compare them with the reference
         # completions that have been generated at the beginning of training. We then compute the win rate and log it to
@@ -402,17 +390,17 @@ class WinRateCallback(TrainerCallback):
                     )
                     wandb.log({"win_rate_completions": wandb.Table(dataframe=df)})
 
-            if "comet_ml" in args.report_to:
-                df = _win_rate_completions_df(
-                    state=state,
-                    prompts=prompts,
-                    completions=completions,
-                    winner_indices=winner_indices,
-                )
-                log_table_to_comet_experiment(
-                    name="win_rate_completions.csv",
-                    table=df,
-                )
+            # if "comet_ml" in args.report_to:
+            #     df = _win_rate_completions_df(
+            #         state=state,
+            #         prompts=prompts,
+            #         completions=completions,
+            #         winner_indices=winner_indices,
+            #     )
+                # log_table_to_comet_experiment(
+                #     name="win_rate_completions.csv",
+                #     table=df,
+                # )
 
 
 class LogCompletionsCallback(TrainerCallback):
@@ -495,12 +483,6 @@ class LogCompletionsCallback(TrainerCallback):
 
             if "wandb" in args.report_to:
                 wandb.log({"completions": table})
-
-            if "comet_ml" in args.report_to:
-                log_table_to_comet_experiment(
-                    name="completions.csv",
-                    table=table,
-                )
 
         # Save the last logged step, so we don't log the same completions multiple times
         self._last_logged_step = state.global_step

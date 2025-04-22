@@ -15,10 +15,13 @@
 import contextlib
 import functools
 import os
+import zmq
+import time
+import json
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union
+from typing import Any, Callable, Optional, Sized, Union, List
 from unittest.mock import patch
 
 import torch
@@ -53,7 +56,7 @@ from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
 from .utils import (
     generate_model_card,
-    get_comet_experiment_url,
+    #get_comet_experiment_url,
     pad,
     print_prompt_completions_sample,
     selective_log_softmax,
@@ -74,6 +77,9 @@ if is_wandb_available():
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
+ZMQ_CONTEXT = zmq.Context()
+ZMQ_SOCKET = ZMQ_CONTEXT.socket(zmq.REQ)
+ZMQ_SOCKET.connect("tcp://localhost:5555") # Replace with your ZMQ server address
 
 class RepeatRandomSampler(Sampler):
     """
@@ -332,6 +338,8 @@ class GRPOTrainer(Trainer):
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            if processing_class.pad_token_id is None:
+                processing_class.pad_token = processing_class.eos_token
 
         # Reward functions
         if not isinstance(reward_funcs, list):
@@ -576,6 +584,55 @@ class GRPOTrainer(Trainer):
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
+    def _call_zmq_reward_server(self, prompts, completions, task_type, task_data, kwargs, evaluate=False) -> List[List[float]]:
+        """Sends data to ZMQ server and returns rewards."""
+        if task_type != "cpt":
+            # response length reward
+            return [-abs(20 - len(completion)) for completion in completions]
+
+        # --- ZMQ Implementation (Uncomment and adapt) ---
+        #log_on_all_ranks(self.accelerator, f"Sending {len(prompts)} prompts to ZMQ reward server...")
+        try:
+            message = {
+                "prompt_texts": prompts,
+                "completions_texts": completions,
+                "task_type": task_type,
+                "task_specific_data": task_data,
+                "evaluate": evaluate,
+                "trainer_info": {"class": str(self.__class__.__name__), "rank": self.accelerator.process_index}, # Example info
+                **kwargs
+            }
+            # Ensure JSON serializability
+            # Might need to convert complex objects (like dicts in task_data for CPT) if necessary
+            serializable_message = json.loads(json.dumps(message))
+
+            self.zmq_socket.send_json(serializable_message)
+            response = self.zmq_socket.recv_json()
+            #log_on_all_ranks(self.accelerator, "Received response from ZMQ reward server.")
+
+            nested_scores_list = response.get("rewards", None)
+
+            # Validation
+            if not isinstance(nested_scores_list, list) or len(nested_scores_list) != len(prompts):
+                raise ValueError(f"ZMQ reward function returned invalid data. Expected list of {len(prompts)} lists. Got: {type(nested_scores_list)} len {len(nested_scores_list)}")
+            for i, sublist in enumerate(nested_scores_list):
+                 k = len(completions[i])
+                 if not isinstance(sublist, list) or len(sublist) != k:
+                      raise ValueError(f"ZMQ reward sublist for prompt {i} invalid. Expected list of {k} floats. Got: {type(sublist)} len {len(sublist)}")
+                 # Optional: Check if values are floats? Handled by ZMQ server ideally.
+
+            return nested_scores_list
+
+        except zmq.ZMQError as e:
+            #log_on_all_ranks(self.accelerator, f"ZMQ Error communicating with reward server: {e}")
+            # Handle error appropriately - maybe return default low scores or raise
+            raise RuntimeError(f"Failed to get rewards from ZMQ server: {e}") from e
+        except Exception as e:
+            #log_on_all_ranks(self.accelerator, f"Error processing ZMQ reward request/response: {e}")
+            raise RuntimeError(f"Failed during ZMQ communication: {e}") from e
+        # --- End ZMQ Implementation ---
+
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -855,10 +912,12 @@ class GRPOTrainer(Trainer):
                     # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                     keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                     reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                    output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+
+                    # Send data to ZMQ server
+                    output_reward_func = self._call_zmq_reward_server(prompts, completions, None, [], reward_kwargs)
+                    #output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                     # Convert None values to NaN
                     output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # If all reward functions return None for a given row, issue a detailed warning
@@ -1070,7 +1129,7 @@ class GRPOTrainer(Trainer):
             dataset_name=dataset_name,
             tags=tags,
             wandb_url=wandb.run.get_url() if is_wandb_available() and wandb.run is not None else None,
-            comet_url=get_comet_experiment_url(),
+            #comet_url=get_comet_experiment_url(),
             trainer_name="GRPO",
             trainer_citation=citation,
             paper_title="DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models",
