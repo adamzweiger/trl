@@ -21,7 +21,7 @@ import json
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union, List
+from typing import Any, Callable, Optional, Sized, Union, List, Dict, Iterable
 from unittest.mock import patch
 
 import torch
@@ -47,6 +47,9 @@ from transformers import (
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
+import requests
+from safetensors.torch import save_file
+import gc
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..extras.profiling import profiling_context, profiling_decorator
@@ -64,7 +67,7 @@ from .utils import (
 
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model
+    from peft import PeftConfig, get_peft_model, get_peft_model_state_dict
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
@@ -393,6 +396,15 @@ class GRPOTrainer(Trainer):
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.temperature = args.temperature
         self.use_vllm = args.use_vllm
+        self.vllm_api_url   = args.vllm_api_url
+        self.vllm_adapter_name = args.vllm_adapter_name
+        self.api_session = requests.Session()  # reused across calls
+
+        # external ⇔ internal switch
+        self._use_external_vllm = self.use_vllm and self.vllm_api_url is not None
+
+        self._last_adapter_step = -1
+        self.base_model_id = model_id
 
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
@@ -452,7 +464,7 @@ class GRPOTrainer(Trainer):
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
 
-        if self.use_vllm:
+        if self.use_vllm and not self._use_external_vllm:
             if not is_vllm_available():
                 raise ImportError(
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
@@ -563,6 +575,14 @@ class GRPOTrainer(Trainer):
                 repetition_penalty=args.repetition_penalty,
                 cache_implementation=args.cache_implementation,
             )
+
+        if self._use_external_vllm:
+            self.sampling_params = {
+                "n": self.num_generations,
+                "max_tokens": self.max_completion_length,
+                "temperature": self.temperature,
+                "top_p": self.args.top_p,
+            }
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
@@ -792,8 +812,71 @@ class GRPOTrainer(Trainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
-        # Generate completions using either vLLM or regular generation
-        if self.args.use_vllm:
+        if self._use_external_vllm:
+            # 1. gather all prompts on rank 0 so we hit the API once
+            all_prompts_text = gather_object(prompts_text)
+            
+            if is_peft_model(self.model):
+                adapter_dir = os.path.join(self.args.adapter_save_dir,
+                                        self.vllm_adapter_name)
+                # dump only once per training step
+                if self.state.global_step != self._last_adapter_step:
+                    print(f"Global step: {self.state.global_step} | Last adapter step: {self._last_adapter_step} | Saving adapter to {adapter_dir}")
+                    os.makedirs(adapter_dir, exist_ok=True)
+
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    full_state  = self.model_wrapped._zero3_consolidated_16bit_state_dict()
+                    lora_state  = get_peft_model_state_dict(unwrapped, full_state)
+                    del full_state
+                    
+                    if self.accelerator.is_main_process:
+                        save_file(lora_state, f"{adapter_dir}/adapter_model.safetensors")
+                        active = unwrapped.active_adapter
+                        unwrapped.peft_config[active].save_pretrained(adapter_dir)
+
+                        assert os.path.isdir(adapter_dir) and os.listdir(adapter_dir), \
+                            f"[vLLM] {adapter_dir} is empty"
+                        print(f"[vLLM] Loading/refreshing adapter '{self.vllm_adapter_name}'")
+                        self._unload_adapter_via_api(self.vllm_adapter_name)
+                        self._load_adapter_via_api(adapter_dir, self.vllm_adapter_name)
+
+                    del lora_state
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+                    self.accelerator.wait_for_everyone()
+                    self._last_adapter_step = self.state.global_step
+                if self.accelerator.is_main_process:
+                    texts = self._generate_via_vllm_api(
+                        all_prompts_text,
+                        self.vllm_adapter_name,
+                        self.sampling_params,
+                    )
+                    print(f"Texts from {self.vllm_adapter_name} generated.")
+                else:
+                    texts = [None] * (len(all_prompts_text) * self.num_generations)
+            else:
+                texts = [""] * (len(all_prompts_text) * self.num_generations)
+            
+            self.accelerator.wait_for_everyone()
+            
+            # Broadcast back to all ranks and slice our shard
+            texts = broadcast_object_list(texts, from_process=0)
+            proc_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            texts = texts[proc_slice]
+
+            #   encode → tensor → pad
+            completion_ids = [
+                torch.tensor(self.processing_class.encode(t), device=device)
+                for t in texts
+            ]
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id).long()
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
+        elif self.use_vllm:
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
@@ -1137,3 +1220,103 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
+
+    # --------------------------------------------------------------------------- #
+
+    def _vllm_api(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: int = 120,
+        ok_codes: Iterable[int] = (200,),
+        retries: int = 3,
+    ) -> Optional[Any]:
+        """
+        Low-level helper that POSTs to ``{self.vllm_api_url}/v1/{endpoint}``
+        with basic retry/back-off.
+
+        Returns JSON / text / True on the first OK response,
+        or **None** after all retries fail.
+        """
+        url = f"{self.vllm_api_url.rstrip('/')}/v1/{endpoint}"
+
+        for attempt in range(1, retries + 1):
+            try:
+                print(f"POST {endpoint} try {attempt}/{retries} payload={payload}")
+                resp = self.api_session.post(url, json=payload, timeout=timeout)
+
+                if resp.status_code in ok_codes:
+                    print(f"{endpoint} → {resp.status_code}")
+                    if resp.headers.get("content-type", "").startswith("application/json"):
+                        return resp.json()
+                    return resp.text or True  # 204 etc.
+
+                resp.raise_for_status()  # will jump to except:
+
+            except requests.RequestException as exc:
+                print(f"API {endpoint} error ({exc}) try {attempt}/{retries}")
+                time.sleep(2 * attempt)  # simple back-off
+
+        print(f"API {endpoint} failed after {retries} retries")
+        return None
+
+    def _load_adapter_via_api(self, path: str, name: str) -> bool:
+        """Load (or refresh) a LoRA adapter in vLLM."""
+        if not self.is_world_process_zero():
+            return True  # other ranks assume success
+        return (
+            self._vllm_api(
+                "load_lora_adapter",
+                {"lora_name": name, "lora_path": path},
+                timeout=180,
+            )
+            is not None
+        )
+
+    def _unload_adapter_via_api(self, name: str) -> bool:
+        """Unload an adapter - treat 404 ('not loaded') as success."""
+        if not self.is_world_process_zero():
+            return True
+        self._vllm_api(
+            "unload_lora_adapter",
+            {"lora_name": name},
+            ok_codes=(200, 404),
+            timeout=60,
+        )
+        return True  # always succeed for caller
+
+    def _generate_via_vllm_api(
+        self,
+        prompts_text: List[str],
+        adapter_name: str,
+        sampling_params: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Send prompts to the vLLM `/v1/completions` endpoint and return the
+        generated texts.  Non-zero ranks return a dummy list of the correct
+        size; rank-0 performs the call and broadcasts later.
+        """
+        n_per_prompt = sampling_params.get("n", 1)
+        expected = len(prompts_text) * n_per_prompt
+
+        if not self.is_world_process_zero():
+            return [""] * expected  # placeholder
+
+        # dynamic timeout: 60 s base + 10 s per completion requested
+        timeout = 60 + 10 * expected
+        payload = {
+            "model": adapter_name,
+            "prompt": prompts_text,
+            **sampling_params,
+        }
+
+        res = self._vllm_api("completions", payload, timeout=timeout, retries=5)
+        if isinstance(res, dict) and "choices" in res and len(res["choices"]) == expected:
+            return [c["text"] for c in res["choices"]]
+
+        choices_len = len(res.get("choices", [])) if isinstance(res, dict) else "no"
+        print(
+            f"Generation failed or returned {choices_len} choices (expected {expected})"
+        )
+        return ["ERROR: FAILED GENERATION"] * expected

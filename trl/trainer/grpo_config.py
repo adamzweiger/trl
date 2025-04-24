@@ -348,3 +348,43 @@ class GRPOConfig(TrainingArguments):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
+
+    lora_rank: int = field(
+        default=0,
+        metadata={
+            "help": "LoRA rank. If 0, no adapter is used and all base weights stay trainable."
+        },
+    )
+    lora_alpha: int = field(
+        default=32,
+        metadata={"help": "LoRA alpha (scales the adapter weight update)."},
+    )
+    lora_dropout: float = field(
+        default=0.05,
+        metadata={"help": "LoRA dropout probability."},
+    )
+
+    adapter_save_dir: str = field(
+        default="lora-adapter",
+        metadata={
+            "help": "Directory to save the LoRA adapter. If not specified, the adapter will be saved in the same "
+            "directory as the model."
+        },
+    )
+    vllm_api_url: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "If set, GRPOTrainer will send /v1/completions requests to that vLLM server "
+                     "instead of running an in-process engine."
+        },
+    )
+    vllm_adapter_name: str = field(
+        default="dynamic_training_adapter",
+        metadata={"help": "The LoRA adapter name you pass to vLLM’s load_lora_adapter endpoint."},
+    )
+    model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to the model or model identifier from huggingface.co/models."
+        },
+    )
