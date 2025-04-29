@@ -380,7 +380,7 @@ class GRPOConfig(TrainingArguments):
     )
     vllm_adapter_name: str = field(
         default="dynamic_training_adapter",
-        metadata={"help": "The LoRA adapter name you pass to vLLM’s load_lora_adapter endpoint."},
+        metadata={"help": "The LoRA adapter name you pass to vLLM's load_lora_adapter endpoint."},
     )
     model_name_or_path: Optional[str] = field(
         default=None,

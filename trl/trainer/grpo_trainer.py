@@ -15,7 +15,6 @@
 import contextlib
 import functools
 import os
-import zmq
 import time
 import json
 import textwrap
@@ -79,10 +78,6 @@ if is_wandb_available():
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
-
-ZMQ_CONTEXT = zmq.Context()
-ZMQ_SOCKET = ZMQ_CONTEXT.socket(zmq.REQ)
-ZMQ_SOCKET.connect("tcp://localhost:5555") # Replace with your ZMQ server address
 
 class RepeatRandomSampler(Sampler):
     """
@@ -605,55 +600,6 @@ class GRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
-    def _call_zmq_reward_server(self, prompts, completions, task_type, task_data, kwargs, evaluate=False) -> List[List[float]]:
-        """Sends data to ZMQ server and returns rewards."""
-        if task_type != "cpt":
-            # response length reward
-            return [-abs(20 - len(completion)) for completion in completions]
-
-        # --- ZMQ Implementation (Uncomment and adapt) ---
-        #log_on_all_ranks(self.accelerator, f"Sending {len(prompts)} prompts to ZMQ reward server...")
-        try:
-            message = {
-                "prompt_texts": prompts,
-                "completions_texts": completions,
-                "task_type": task_type,
-                "task_specific_data": task_data,
-                "evaluate": evaluate,
-                "trainer_info": {"class": str(self.__class__.__name__), "rank": self.accelerator.process_index}, # Example info
-                **kwargs
-            }
-            # Ensure JSON serializability
-            # Might need to convert complex objects (like dicts in task_data for CPT) if necessary
-            serializable_message = json.loads(json.dumps(message))
-
-            self.zmq_socket.send_json(serializable_message)
-            response = self.zmq_socket.recv_json()
-            #log_on_all_ranks(self.accelerator, "Received response from ZMQ reward server.")
-
-            nested_scores_list = response.get("rewards", None)
-
-            # Validation
-            if not isinstance(nested_scores_list, list) or len(nested_scores_list) != len(prompts):
-                raise ValueError(f"ZMQ reward function returned invalid data. Expected list of {len(prompts)} lists. Got: {type(nested_scores_list)} len {len(nested_scores_list)}")
-            for i, sublist in enumerate(nested_scores_list):
-                 k = len(completions[i])
-                 if not isinstance(sublist, list) or len(sublist) != k:
-                      raise ValueError(f"ZMQ reward sublist for prompt {i} invalid. Expected list of {k} floats. Got: {type(sublist)} len {len(sublist)}")
-                 # Optional: Check if values are floats? Handled by ZMQ server ideally.
-
-            return nested_scores_list
-
-        except zmq.ZMQError as e:
-            #log_on_all_ranks(self.accelerator, f"ZMQ Error communicating with reward server: {e}")
-            # Handle error appropriately - maybe return default low scores or raise
-            raise RuntimeError(f"Failed to get rewards from ZMQ server: {e}") from e
-        except Exception as e:
-            #log_on_all_ranks(self.accelerator, f"Error processing ZMQ reward request/response: {e}")
-            raise RuntimeError(f"Failed during ZMQ communication: {e}") from e
-        # --- End ZMQ Implementation ---
-
-
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs.
@@ -843,7 +789,7 @@ class GRPOTrainer(Trainer):
                     del lora_state
                     torch.cuda.empty_cache()
                     gc.collect()
-
+                    print(f"[vLLM] {self.accelerator.process_index} finished unloading and loading adapter.")
                     self.accelerator.wait_for_everyone()
                     self._last_adapter_step = self.state.global_step
                 if self.accelerator.is_main_process:
@@ -858,8 +804,9 @@ class GRPOTrainer(Trainer):
             else:
                 texts = [""] * (len(all_prompts_text) * self.num_generations)
             
+            print(f"[vLLM] {self.accelerator.process_index} generated {len(texts)} texts: {texts}")
             self.accelerator.wait_for_everyone()
-            
+            print(f"[vLLM] {self.accelerator.process_index} finished waiting for everyone to generate texts.")
             # Broadcast back to all ranks and slice our shard
             texts = broadcast_object_list(texts, from_process=0)
             proc_slice = slice(
@@ -867,7 +814,7 @@ class GRPOTrainer(Trainer):
                 (self.accelerator.process_index + 1) * len(prompts),
             )
             texts = texts[proc_slice]
-
+            print(f"[vLLM] {self.accelerator.process_index} sliced {len(texts)} texts: {texts}")
             #   encode → tensor → pad
             completion_ids = [
                 torch.tensor(self.processing_class.encode(t), device=device)
@@ -969,6 +916,7 @@ class GRPOTrainer(Trainer):
             completions = completions_text
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        reward_kwargs: dict[str, list[Any]] = {}
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
@@ -992,16 +940,52 @@ class GRPOTrainer(Trainer):
                     with torch.inference_mode():
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
-                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    # # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                    # keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    # reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
 
-                    # Send data to ZMQ server
-                    output_reward_func = self._call_zmq_reward_server(prompts, completions, None, [], reward_kwargs)
-                    #output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
-                    # Convert None values to NaN
-                    output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
-                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    # output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                    # print(f"rewards: {output_reward_func}")
+                    # # Convert None values to NaN
+                    # output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
+                    # rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                    keys = [k for k in inputs[0] if k not in ("prompt", "completion")]
+                    print(f"[Process {self.accelerator.process_index}] keys: {keys}")
+                    print(f"[Process {self.accelerator.process_index}] prompts: {prompts}")
+                    print(f"[Process {self.accelerator.process_index}] completions: {completions}")
+                    # 1. Gather the full batch on rank-0 so the server sees every sample
+                    all_prompts      = gather_object(prompts)         # size: B_global
+                    all_completions  = gather_object(completions)     # size: B_global
+                    all_kwargs       = {
+                        k: gather_object([ex[k] for ex in inputs]) for k in keys
+                    }                                                 # size: B_global for each aux column
+                    print(f"[Process {self.accelerator.process_index}] all_prompts: {all_prompts}")
+                    print(f"[Process {self.accelerator.process_index}] all_completions: {all_completions}")
+                    print(f"[Process {self.accelerator.process_index}] all_kwargs: {all_kwargs}")
+                    # 2. Only rank-0 queries the ZMQ server
+                    if self.accelerator.is_main_process:
+                        out = reward_func(
+                            prompts=all_prompts,
+                            completions=all_completions,
+                            **all_kwargs,
+                        )
+                        print(f"[Process {self.accelerator.process_index}] out from reward_func: {out}")
+                        out = [r if r is not None else float("nan") for r in out]
+                    else:
+                        # placeholder – will be overwritten by broadcast
+                        out = [0.0] * len(all_prompts)
+                    print(f"[Process {self.accelerator.process_index}] out: {out}")
+                    # 3. Broadcast the list back to every rank
+                    out = broadcast_object_list(out, from_process=0)
+                    print(f"[Process {self.accelerator.process_index}] out after broadcast: {out}")
+                    # 4. Keep only the slice that belongs to *this* rank
+                    proc_slice = slice(
+                        self.accelerator.process_index * len(prompts),
+                        (self.accelerator.process_index + 1) * len(prompts),
+                    )
+                    rewards_per_func[:, i] = torch.tensor(
+                        out[proc_slice], dtype=torch.float32, device=device
+                    )
 
         # If all reward functions return None for a given row, issue a detailed warning
         if torch.isnan(rewards_per_func).all(dim=1).any():
@@ -1016,8 +1000,9 @@ class GRPOTrainer(Trainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
+        print(f"[Process {self.accelerator.process_index}] rewards_per_func: {rewards_per_func}")
         rewards_per_func = gather(rewards_per_func)
-
+        print(f"[Process {self.accelerator.process_index}] rewards_per_func after gather: {rewards_per_func}")
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
